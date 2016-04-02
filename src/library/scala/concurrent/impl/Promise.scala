@@ -49,26 +49,6 @@ private[concurrent] trait Promise[T] extends scala.concurrent.Promise[T] with sc
   }
 }
 
-/* Precondition: `executor` is prepared, i.e., `executor` has been returned from invocation of `prepare` on some other `ExecutionContext`.
- */
-private final class CallbackRunnable[T](val executor: ExecutionContext, val onComplete: Try[T] => Any) extends Runnable with OnCompleteRunnable {
-  // must be filled in before running it
-  var value: Try[T] = null
-
-  override def run(): Unit = {
-    require(value ne null) // must set value to non-null before running!
-    try onComplete(value) catch { case NonFatal(e) => executor reportFailure e }
-  }
-
-  def executeWithValue(v: Try[T]): Unit = {
-    require(value eq null) // can't complete it twice
-    value = v
-    // Note that we cannot prepare the ExecutionContext at this point, since we might
-    // already be running on a different thread!
-    try executor.execute(this) catch { case NonFatal(t) => executor reportFailure t }
-  }
-}
-
 private[concurrent] object Promise {
 
   private def resolveTry[T](source: Try[T]): Try[T] = source match {
@@ -84,22 +64,77 @@ private[concurrent] object Promise {
     case t                                         => Failure(t)
   }
 
-   /**
-    * Latch used to implement waiting on a DefaultPromise's result.
-    *
-    * Inspired by: http://gee.cs.oswego.edu/cgi-bin/viewcvs.cgi/jsr166/src/main/java/util/concurrent/locks/AbstractQueuedSynchronizer.java
-    * Written by Doug Lea with assistance from members of JCP JSR-166
-    * Expert Group and released to the public domain, as explained at
-    * http://creativecommons.org/publicdomain/zero/1.0/
-    */
-    private final class CompletionLatch[T] extends AbstractQueuedSynchronizer with (Try[T] => Unit) {
-      override protected def tryAcquireShared(ignored: Int): Int = if (getState != 0) 1 else -1
-      override protected def tryReleaseShared(ignore: Int): Boolean = {
-        setState(1)
-        true
-      }
-      override def apply(ignored: Try[T]): Unit = releaseShared(1)
+  sealed trait Callbacks[+T] {
+    def prepend[U >: T](c: Callbacks[U]): Callbacks[U]
+    def executeWithValue(v: Try[T @scala.annotation.unchecked.uncheckedVariance]): Unit
+  }
+
+  case object NoopCallback extends Callbacks[Nothing] {
+    override def prepend[U >: Nothing](c: Callbacks[U]): Callbacks[U] = c
+    override def executeWithValue(v: Try[Nothing]): Unit = ()
+  }
+
+
+  /* Precondition: `executor` is prepar()-ed */
+  final class Callback[T](
+    val executor: ExecutionContext,
+    val onComplete: Try[T] => Any) extends Callbacks[T] with Runnable with OnCompleteRunnable{
+
+    var value: Try[T] = null
+
+    override def run(): Unit = {
+      require(value ne null) // must set value to non-null before running!
+      try onComplete(value) catch { case NonFatal(e) => executor reportFailure e } finally { value = null }
     }
+
+    override def executeWithValue(v: Try[T]): Unit = {
+      require(value eq null) // can't complete it twice
+      value = v
+      // Note that we cannot prepare the ExecutionContext at this point, since we might
+      // already be running on a different thread!
+      try executor.execute(this) catch { case NonFatal(t) => executor reportFailure t }
+    }
+
+    override def prepend[U >: T](c: Callbacks[U]): Callbacks[U] = c match {
+      case NoopCallback => this
+      case a: Callback[U] if a eq this => a
+      case a: Callback[U] => new ManyCallbacks[U](this :: a :: Nil)
+      case c: ManyCallbacks[U] => new ManyCallbacks[U](this :: c.callbacks)
+    }
+  }
+
+  final class ManyCallbacks[T](val callbacks: List[Callbacks[T]]) extends Callbacks[T] {
+    override def prepend[U >: T](c: Callbacks[U]): Callbacks[U] = c match {
+      case m: ManyCallbacks[U] if m eq this => m
+      case any: Callbacks[U] => new ManyCallbacks[U](any :: callbacks)
+    }
+
+    override def executeWithValue(v: Try[T]): Unit = {
+      @tailrec def executeAll(remaining: List[Callbacks[T]], v: Try[T]): Unit = 
+        if (remaining.nonEmpty) {
+          remaining.head.executeWithValue(v)
+          executeAll(remaining.tail, v)
+        }
+      executeAll(callbacks, v)
+    }
+  }
+
+  /**
+   * Latch used to implement waiting on a DefaultPromise's result.
+   *
+   * Inspired by: http://gee.cs.oswego.edu/cgi-bin/viewcvs.cgi/jsr166/src/main/java/util/concurrent/locks/AbstractQueuedSynchronizer.java
+   * Written by Doug Lea with assistance from members of JCP JSR-166
+   * Expert Group and released to the public domain, as explained at
+   * http://creativecommons.org/publicdomain/zero/1.0/
+   */
+   private final class CompletionLatch[T] extends AbstractQueuedSynchronizer with (Try[T] => Unit) {
+     override protected def tryAcquireShared(ignored: Int): Int = if (getState != 0) 1 else -1
+     override protected def tryReleaseShared(ignore: Int): Boolean = {
+       setState(1)
+       true
+     }
+     override def apply(ignored: Try[T]): Unit = releaseShared(1)
+   }
 
 
   /** Default promise implementation.
@@ -120,7 +155,7 @@ private[concurrent] object Promise {
    *  AtomicReference. The type of object stored in the cell fully describes the
    *  current state of the promise.
    *
-   *  1. List[CallbackRunnable] - The promise is incomplete and has zero or more callbacks
+   *  1. Promise.Callbacks[T] - The promise is incomplete and has zero or more callbacks
    *     to call when it is eventually completed.
    *  2. Try[T] - The promise is complete and now contains its value.
    *  3. DefaultPromise[T] - The promise is linked to another promise.
@@ -180,7 +215,7 @@ private[concurrent] object Promise {
    */
   // Left non-final to enable addition of extra fields by Java/Scala converters
   // in scala-java8-compat.
-  class DefaultPromise[T] extends AtomicReference[AnyRef](Nil) with Promise[T] {
+  class DefaultPromise[T] extends AtomicReference[AnyRef](NoopCallback) with Promise[T] {
 
     /** Get the root promise for this promise, compressing the link chain to that
      *  promise if necessary.
@@ -260,62 +295,56 @@ private[concurrent] object Promise {
 
     @tailrec
     private def value0: Option[Try[T]] = get() match {
-      case c: Try[_] => Some(c.asInstanceOf[Try[T]])
+      case c: Try[_]             => Some(c.asInstanceOf[Try[T]])
       case dp: DefaultPromise[_] => compressedRoot(dp).value0
-      case _: List[_] => None
+      case _: Callbacks[_]       => None
     }
 
     override final def isCompleted: Boolean = isCompleted0
 
     @tailrec
     private def isCompleted0: Boolean = get() match {
-      case _: Try[_] => true
+      case _: Try[_]             => true
       case dp: DefaultPromise[_] => compressedRoot(dp).isCompleted0
-      case _: List[_] => false
+      case _: Callbacks[_]       => false
     }
 
     final def tryComplete(value: Try[T]): Boolean = {
       val resolved = resolveTry(value)
-      tryCompleteAndGetListeners(resolved) match {
+      tryCompleteAndGetCallbacks(resolved) match {
         case null => false
-        case listeners =>
-          @tailrec def executeAll(remaining: List[CallbackRunnable[T]]): Boolean =
-            if (remaining.nonEmpty) {
-              remaining.head.executeWithValue(resolved)
-              executeAll(remaining.tail)
-            } else true
-          executeAll(listeners)
+        case callbacks => callbacks.executeWithValue(resolved); true
       }
     }
 
     /** Called by `tryComplete` to store the resolved value and get the list of
-     *  listeners, or `null` if it is already completed.
+     *  callbacks, or `null` if it is already completed.
      */
     @tailrec
-    private def tryCompleteAndGetListeners(v: Try[T]): List[CallbackRunnable[T]] = {
+    private def tryCompleteAndGetCallbacks(v: Try[T]): Callbacks[T] = {
       get() match {
-        case raw: List[_] =>
-          val cur = raw.asInstanceOf[List[CallbackRunnable[T]]]
-          if (compareAndSet(cur, v)) cur else tryCompleteAndGetListeners(v)
-        case dp: DefaultPromise[_] => compressedRoot(dp).tryCompleteAndGetListeners(v)
         case _: Try[_] => null
+        case cb: Callbacks[_] =>
+          val cur = cb.asInstanceOf[Callbacks[T]]
+          if (compareAndSet(cur, v)) cur else tryCompleteAndGetCallbacks(v)
+        case dp: DefaultPromise[_] => compressedRoot(dp).tryCompleteAndGetCallbacks(v)
       }
     }
 
     final def onComplete[U](func: Try[T] => U)(implicit executor: ExecutionContext): Unit =
-      dispatchOrAddCallback(new CallbackRunnable[T](executor.prepare(), func))
+      dispatchOrAddCallbacks(new Callback[T](executor.prepare(), func))
 
     /** Tries to add the callback, if already completed, it dispatches the callback to be executed.
      *  Used by `onComplete()` to add callbacks to a promise and by `link()` to transfer callbacks
      *  to the root promise when linking two promises together.
      */
     @tailrec
-    private def dispatchOrAddCallback(runnable: CallbackRunnable[T]): Unit = {
+    private def dispatchOrAddCallbacks(c: Callbacks[T]): Unit = {
       get() match {
-        case r: Try[_]          => runnable.executeWithValue(r.asInstanceOf[Try[T]])
-        case dp: DefaultPromise[_] => compressedRoot(dp).dispatchOrAddCallback(runnable)
-        case listeners: List[_] => if (compareAndSet(listeners, runnable :: listeners)) ()
-                                   else dispatchOrAddCallback(runnable)
+        case r: Try[_]             => c.executeWithValue(r.asInstanceOf[Try[T]])
+        case dp: DefaultPromise[_] => compressedRoot(dp).dispatchOrAddCallbacks(c)
+        case cb: Callbacks[_]      => if (compareAndSet(cb, cb.prepend(c))) ()
+                                      else dispatchOrAddCallbacks(c)
       }
     }
 
@@ -326,7 +355,7 @@ private[concurrent] object Promise {
 
     /** Link this promise to another promise so that both promises share the same
      *  externally-visible state. Depending on the current state of this promise, this
-     *  may involve different things. For example, any onComplete listeners will need
+     *  may involve different things. For example, any onComplete callbacks will need
      *  to be transferred.
      *
      *  If this promise is already completed, then the same effect as linking -
@@ -341,15 +370,8 @@ private[concurrent] object Promise {
             throw new IllegalStateException("Cannot link completed promises together")
         case dp: DefaultPromise[_] =>
           compressedRoot(dp).link(target)
-        case listeners: List[_] =>
-          if(compareAndSet(listeners, target)) {
-            @tailrec def dispatchAll(remaining: List[CallbackRunnable[T]]): Unit =
-              if (remaining.nonEmpty) {
-                target.dispatchOrAddCallback(remaining.head)
-                dispatchAll(remaining.tail)
-              }
-            dispatchAll(listeners.asInstanceOf[List[CallbackRunnable[T]]])
-          } else link(target)
+        case cb: Callbacks[_] =>
+          if(compareAndSet(cb, target)) target.dispatchOrAddCallbacks(cb.asInstanceOf[Callbacks[T]]) else link(target)
       }
     }
   }
@@ -372,7 +394,7 @@ private[concurrent] object Promise {
       override def tryComplete(value: Try[T]): Boolean = false
 
       override def onComplete[U](func: Try[T] => U)(implicit executor: ExecutionContext): Unit =
-        (new CallbackRunnable(executor.prepare(), func)).executeWithValue(result)
+        (new Callback(executor.prepare(), func)).executeWithValue(result)
 
       override def ready(atMost: Duration)(implicit permit: CanAwait): this.type = this
 
