@@ -11,7 +11,8 @@ package scala.concurrent.impl
 import scala.concurrent.{ ExecutionContext, CanAwait, OnCompleteRunnable, TimeoutException, ExecutionException }
 import scala.concurrent.Future.InternalCallbackExecutor
 import scala.concurrent.duration.{ Duration, FiniteDuration }
-import scala.annotation.tailrec
+import scala.annotation.{ tailrec, switch }
+import scala.annotation.unchecked.uncheckedVariance
 import scala.util.control.NonFatal
 import scala.util.{ Try, Success, Failure }
 
@@ -64,18 +65,26 @@ private[concurrent] object Promise {
     case t                                         => Failure(t)
   }
 
+  /* Encodes the concept of having callbacks
+   */
   sealed trait Callbacks[+T] {
+    /* Logically prepends the callback `c` onto `this` callback */
     def prepend[U >: T](c: Callbacks[U]): Callbacks[U]
-    def executeWithValue(v: Try[T @scala.annotation.unchecked.uncheckedVariance]): Unit
+    /* Submits the callback function(s) represented by this Callback to be executed with the given value `v` */
+    def submitWithValue(v: Try[T @uncheckedVariance]): Unit
   }
 
+  /* Represents 0 Callbacks, is used as an initial, sentinel, value for DefaultPromise
+   */
   case object NoopCallback extends Callbacks[Nothing] {
     override def prepend[U >: Nothing](c: Callbacks[U]): Callbacks[U] = c
-    override def executeWithValue(v: Try[Nothing]): Unit = ()
+    override def submitWithValue(v: Try[Nothing]): Unit = ()
+    override def toString: String = "Callback(<Noop>)"
   }
 
 
-  /* Precondition: `executor` is prepar()-ed */
+  /* Represents a single Callback function.
+     Precondition: `executor` is prepar()-ed */
   final class Callback[T](
     val executor: ExecutionContext,
     val onComplete: Try[T] => Any) extends Callbacks[T] with Runnable with OnCompleteRunnable{
@@ -87,9 +96,9 @@ private[concurrent] object Promise {
       case some => try onComplete(some) catch { case NonFatal(e) => executor reportFailure e } finally { value = null }
     }
 
-    override def executeWithValue(v: Try[T]): Unit = value match {
+    override def submitWithValue(v: Try[T]): Unit = value match {
       case null =>
-        value = v
+        value = v // Safe publication of `value`, to run(), is achieved via `executor.execute(this)`
         // Note that we cannot prepare the ExecutionContext at this point, since we might
         // already be running on a different thread!
         try executor.execute(this) catch { case NonFatal(t) => executor reportFailure t }
@@ -102,38 +111,73 @@ private[concurrent] object Promise {
       case a: Callback[U]      => new ManyCallbacks[U](c3 = this, c4 = a)
       case c: ManyCallbacks[U] => c append this // c append this == this prepend c
     }
+
+    override def toString: String = s"Callback($executor, $onComplete)"
   }
 
-  final class ManyCallbacks[T](
+  final class ManyCallbacks[+T](
     val c1: Callbacks[T] = NoopCallback,
     val c2: Callbacks[T] = NoopCallback,
     val c3: Callbacks[T],
     val c4: Callbacks[T]) extends Callbacks[T] {
 
+    private[ManyCallbacks] final def remainingCapacity(): Int =
+      if (c2 eq NoopCallback) 2 else if (c1 eq NoopCallback) 1 else 0
+
+    private[ManyCallbacks] def merge[U >: T](c: ManyCallbacks[U]): ManyCallbacks[U] =
+      (remainingCapacity(): @switch) match {
+        case 0 =>
+          (c.remainingCapacity(): @switch) match {
+            case 0 => new ManyCallbacks[U](c3 = this, c4 = c)
+            case 1 => new ManyCallbacks[U](c1 = c1, c2 = c2, c3 = c3, c4 = new ManyCallbacks[U](c1 = c4, c2 = c.c2, c3 = c.c3, c4 = c.c4))
+            case 2 => new ManyCallbacks[U](c2 = c1, c3 = c2, c4 = new ManyCallbacks[U](c1 = c3, c2 = c4, c3 = c.c3, c4 = c.c4))
+          }
+        case 1 =>
+          (c.remainingCapacity(): @switch) match {
+            case 0 => new ManyCallbacks[U](c1 = c2, c2 = c3, c3 = c4, c4 = c)
+            case 1 => new ManyCallbacks[U](c2 = c2, c3 = c3, c4 = new ManyCallbacks[U](c1 = c4, c2 = c.c2, c3 = c.c3, c4 = c.c4))
+            case 2 => new ManyCallbacks[U](c3 = c2, c4 = new ManyCallbacks[U](c1 = c3, c2 = c4, c3 = c.c3, c4 = c.c4))
+          }
+        case 2 =>
+          (c.remainingCapacity(): @switch) match {
+            case 0 => new ManyCallbacks[U](c1 = c2, c2 = c3, c3 = c4, c4 = c)
+            case 1 => new ManyCallbacks[U](c3 = c3, c4 = new ManyCallbacks[U](c1 = c4, c2 = c.c2, c3 = c.c3, c4 = c.c4))
+            case 2 => new ManyCallbacks[U](c1 = c3, c2 = c4, c3 = c.c3, c4 = c.c4)
+          }
+      }
+
     def append[U >: T](c: Callbacks[U]): Callbacks[U] = c match {
-      case NoopCallback      => this
-      case m if m eq this    => m
-      case any: Callbacks[U] =>
-        if (c2 eq NoopCallback) new ManyCallbacks[U](c2 = c3, c3 = c4, c4 = any)
-        else if (c1 eq NoopCallback) new ManyCallbacks[U](c1 = c2, c2 = c3, c3 = c4, c4 = any)
-        else new ManyCallbacks(c3 = this, c4 = any)
+      case NoopCallback        => this
+      case m if m eq this      => m
+      case m: ManyCallbacks[U] => this merge m
+      case any: Callback[U]    =>
+        (remainingCapacity(): @switch) match {
+          case 0 => new ManyCallbacks(c3 = this, c4 = any)
+          case 1 => new ManyCallbacks[U](c1 = c2, c2 = c3, c3 = c4, c4 = any)
+          case 2 => new ManyCallbacks[U](c2 = c3, c3 = c4, c4 = any)
+        }
     }
 
     override def prepend[U >: T](c: Callbacks[U]): Callbacks[U] = c match {
-      case NoopCallback      => this
-      case m if m eq this    => m
-      case any: Callbacks[U] => 
-        if (c2 eq NoopCallback) new ManyCallbacks[U](c2 = any, c3 = c3, c4 = c4)
-        else if (c1 eq NoopCallback) new ManyCallbacks[U](c1 = any, c2 = c2, c3 = c3, c4 = c4)
-        else new ManyCallbacks[U](c3 = any, c4 = this)
+      case NoopCallback        => this
+      case m if m eq this      => m
+      case m: ManyCallbacks[U] => m merge this
+      case any: Callback[U]    =>
+        (remainingCapacity(): @switch) match {
+          case 0 => new ManyCallbacks[U](c3 = any, c4 = this)
+          case 1 => new ManyCallbacks[U](c1 = any, c2 = c2, c3 = c3, c4 = c4)
+          case 2 => new ManyCallbacks[U](c2 = any, c3 = c3, c4 = c4)
+        }
     }
 
-    override def executeWithValue(v: Try[T]): Unit = {
-      c1.executeWithValue(v)
-      c2.executeWithValue(v)
-      c3.executeWithValue(v)
-      c4.executeWithValue(v)
+    override def submitWithValue(v: Try[T @scala.annotation.unchecked.uncheckedVariance]): Unit = {
+      c1.submitWithValue(v)
+      c2.submitWithValue(v)
+      c3.submitWithValue(v)
+      c4.submitWithValue(v)
     }
+
+    override def toString: String = s"Callbacks($c1, $c2, $c3, $c4)"
   }
 
   /**
@@ -330,7 +374,7 @@ private[concurrent] object Promise {
       val resolved = resolveTry(value)
       tryCompleteAndGetCallbacks(resolved) match {
         case null => false
-        case cb => cb.executeWithValue(resolved); true
+        case cb => cb.submitWithValue(resolved); true
       }
     }
 
@@ -357,7 +401,7 @@ private[concurrent] object Promise {
     @tailrec
     private def dispatchOrAddCallbacks(c: Callbacks[T]): Unit =
       get() match {
-        case r: Try[_]             => c.executeWithValue(r.asInstanceOf[Try[T]])
+        case r: Try[_]             => c.submitWithValue(r.asInstanceOf[Try[T]])
         case dp: DefaultPromise[_] => compressedRoot(dp).dispatchOrAddCallbacks(c)
         case cb: Callbacks[_]      => if (compareAndSet(cb, cb.prepend(c))) ()
                                       else dispatchOrAddCallbacks(c)
@@ -410,7 +454,7 @@ private[concurrent] object Promise {
       override def tryComplete(value: Try[T]): Boolean = false
 
       override def onComplete[U](func: Try[T] => U)(implicit executor: ExecutionContext): Unit =
-        (new Callback(executor.prepare(), func)).executeWithValue(result)
+        (new Callback(executor.prepare(), func)).submitWithValue(result)
 
       override def ready(atMost: Duration)(implicit permit: CanAwait): this.type = this
 

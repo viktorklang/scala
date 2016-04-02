@@ -90,6 +90,18 @@ trait FutureCallbacks extends TestBase {
     promise.success(-1)
   }
 
+  def stressTestNumberofCallbacks(): Unit = once {
+    done =>
+      val promise = Promise[Unit]
+      val future = promise.future.flatMap(_ => Future(())).flatMap(_ => Future(())).recoverWith({ case _ => Future(()) })
+      val numbers = new java.util.concurrent.ConcurrentHashMap[Int, Unit]()
+      (0 to 10000) foreach { x => numbers.put(x, ()) }
+      Future.sequence((0 to 10000) map { x => future.andThen({ case _ => numbers.remove(x) }) }) onComplete {
+        _ => done(numbers.isEmpty)
+      }
+      promise.success(())
+  }
+
   testOnSuccess()
   testOnSuccessWhenCompleted()
   testOnSuccessWhenFailed()
@@ -100,6 +112,7 @@ trait FutureCallbacks extends TestBase {
   //testOnFailureWhenSpecialThrowable(7, new InterruptedException)
   testThatNestedCallbacksDoNotYieldStackOverflow()
   testOnFailureWhenTimeoutException()
+  stressTestNumberofCallbacks()
 }
 
 
