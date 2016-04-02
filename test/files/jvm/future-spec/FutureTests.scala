@@ -816,6 +816,22 @@ class FutureTests extends MinimalScalaTest {
       Await.ready(f, defaultTimeout).value.get.toString mustBe expected.toString
     }
 
+    "should have a decent toString representation" in {
+      val i = scala.concurrent.forkjoin.ThreadLocalRandom.current.nextInt()
+      val e = new Exception(i.toString)
+      val successString = "Future(Success("+i+"))"
+      val failureString = "Future(Failure("+e+"))"
+      val notCompletedString = "Future(<not completed>)"
+
+      Future.successful(i).toString mustBe successString
+      Future.failed[Int](e).toString mustBe failureString
+      Promise[Int]().toString mustBe notCompletedString
+      Promise[Int]().success(i).toString mustBe successString
+      Promise[Int]().failure(e).toString mustBe failureString
+      Await.ready(Future(i)(ExecutionContext.global), defaultTimeout).toString mustBe successString
+      Await.ready(Future(throw e)(ExecutionContext.global), defaultTimeout).toString mustBe failureString
+    }
+
   }
 
 }

@@ -55,7 +55,7 @@ private final class CallbackRunnable[T](val executor: ExecutionContext, val onCo
   // must be filled in before running it
   var value: Try[T] = null
 
-  override def run() = {
+  override def run(): Unit = {
     require(value ne null) // must set value to non-null before running!
     try onComplete(value) catch { case NonFatal(e) => executor reportFailure e }
   }
@@ -205,14 +205,12 @@ private[concurrent] object Promise {
     @tailrec
     private[this] final def compressedRoot(linked: DefaultPromise[_]): DefaultPromise[T] = {
       val target = linked.asInstanceOf[DefaultPromise[T]].root
-      if (linked eq target) target
-      else if (compareAndSet(linked, target)) target
-      else {
+      if ((linked eq target) || compareAndSet(linked, target)) target
+      else
         get() match {
           case newLinked: DefaultPromise[_] => compressedRoot(newLinked)
           case _ => this
         }
-      }
     }
 
     /** Get the promise at the root of the chain of linked promises. Used by `compressedRoot()`.
@@ -264,7 +262,7 @@ private[concurrent] object Promise {
     private def value0: Option[Try[T]] = get() match {
       case c: Try[_] => Some(c.asInstanceOf[Try[T]])
       case dp: DefaultPromise[_] => compressedRoot(dp).value0
-      case _ => None
+      case _: List[_] => None
     }
 
     override final def isCompleted: Boolean = isCompleted0
@@ -273,15 +271,20 @@ private[concurrent] object Promise {
     private def isCompleted0: Boolean = get() match {
       case _: Try[_] => true
       case dp: DefaultPromise[_] => compressedRoot(dp).isCompleted0
-      case _ => false
+      case _: List[_] => false
     }
 
     final def tryComplete(value: Try[T]): Boolean = {
       val resolved = resolveTry(value)
       tryCompleteAndGetListeners(resolved) match {
-        case null             => false
-        case rs if rs.isEmpty => true
-        case rs               => rs.foreach(r => r.executeWithValue(resolved)); true
+        case null => false
+        case listeners =>
+          @tailrec def executeAll(remaining: List[CallbackRunnable[T]]): Boolean =
+            if (remaining.nonEmpty) {
+              remaining.head.executeWithValue(resolved)
+              executeAll(remaining.tail)
+            } else true
+          executeAll(listeners)
       }
     }
 
@@ -295,7 +298,7 @@ private[concurrent] object Promise {
           val cur = raw.asInstanceOf[List[CallbackRunnable[T]]]
           if (compareAndSet(cur, v)) cur else tryCompleteAndGetListeners(v)
         case dp: DefaultPromise[_] => compressedRoot(dp).tryCompleteAndGetListeners(v)
-        case _ => null
+        case _: Try[_] => null
       }
     }
 
@@ -338,11 +341,15 @@ private[concurrent] object Promise {
             throw new IllegalStateException("Cannot link completed promises together")
         case dp: DefaultPromise[_] =>
           compressedRoot(dp).link(target)
-        case listeners: List[_] if compareAndSet(listeners, target) =>
-          if (listeners.nonEmpty)
-            listeners.asInstanceOf[List[CallbackRunnable[T]]].foreach(target.dispatchOrAddCallback(_))
-        case _ =>
-          link(target)
+        case listeners: List[_] =>
+          if(compareAndSet(listeners, target)) {
+            @tailrec def dispatchAll(remaining: List[CallbackRunnable[T]]): Unit =
+              if (remaining.nonEmpty) {
+                target.dispatchOrAddCallback(remaining.head)
+                dispatchAll(remaining.tail)
+              }
+            dispatchAll(listeners.asInstanceOf[List[CallbackRunnable[T]]])
+          } else link(target)
       }
     }
   }
