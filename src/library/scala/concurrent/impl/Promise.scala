@@ -89,7 +89,7 @@ private[concurrent] object Promise {
      Precondition: `executor` is prepar()-ed */
   final class Callback[T](
     val executor: ExecutionContext,
-    val onComplete: Try[T] => Any) extends Callbacks[T] with Runnable with OnCompleteRunnable{
+    val onComplete: Try[T] => Any) extends Callbacks[T] with Runnable with OnCompleteRunnable {
 
     var value: Try[T] = null
 
@@ -160,8 +160,8 @@ private[concurrent] object Promise {
       } else this
 
     def append[U >: T](c: Callbacks[U]): Callbacks[U] = c match {
-      case m: ManyCallbacks[U]    => this merge m
-      case a: Callback[U]       =>
+      case m: ManyCallbacks[U] => this merge m
+      case a: Callback[U]      =>
         if (a ne NoopCallback) { // Don't append Noops
           (remainingCapacity(): @switch) match {
             case 0 => new ManyCallbacks(c3 = this, c4 = a)
@@ -172,8 +172,8 @@ private[concurrent] object Promise {
     }
 
     override def prepend[U >: T](c: Callbacks[U]): Callbacks[U] = c match {
-      case m: ManyCallbacks[U]    => m merge this
-      case a: Callback[U]       =>
+      case m: ManyCallbacks[U] => m merge this
+      case a: Callback[U]      =>
         if (a ne NoopCallback) { // Don't prepend Noops
           (remainingCapacity(): @switch) match {
             case 0 => new ManyCallbacks[U](c3 = a, c4 = this)
@@ -315,11 +315,10 @@ private[concurrent] object Promise {
     private[this] final def compressedRoot(linked: DefaultPromise[_]): DefaultPromise[T] = {
       val target = linked.asInstanceOf[DefaultPromise[T]].root
       if ((linked eq target) || compareAndSet(linked, target)) target
-      else
-        get() match {
-          case newLinked: DefaultPromise[_] => compressedRoot(newLinked)
-          case _ => this
-        }
+      else get() match {
+        case newLinked: DefaultPromise[_] => compressedRoot(newLinked)
+        case _ => this
+      }
     }
 
     /** Get the promise at the root of the chain of linked promises. Used by `compressedRoot()`.
@@ -455,7 +454,7 @@ private[concurrent] object Promise {
     import scala.concurrent.Future
     import scala.reflect.ClassTag
 
-    private[this] sealed trait Kept[T] extends Promise[T] {
+    private[this] sealed abstract class Kept[T] extends Promise[T] {
       def result: Try[T]
 
       override def value: Option[Try[T]] = Some(result)
