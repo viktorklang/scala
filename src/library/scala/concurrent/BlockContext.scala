@@ -76,11 +76,16 @@ object BlockContext {
    **/
   def withBlockContext[T](blockContext: BlockContext)(body: => T): T = {
     val old = contextLocal.get // can be null
-    try {
-      contextLocal.set(blockContext)
-      body
-    } finally {
-      contextLocal.set(old)
-    }
+    contextLocal.set(blockContext)
+    try body finally contextLocal.set(old)
+  }
+
+  /**
+   * Installs a current `BlockContext` around executing `f` with parameter `input`.
+   **/
+  def usingBlockContext[I, T](blockContext: BlockContext)(input: I)(f: I => T): T = {
+    val old = contextLocal.get // can be null
+    contextLocal.set(blockContext)
+    try f(input) finally contextLocal.set(old)
   }
 }

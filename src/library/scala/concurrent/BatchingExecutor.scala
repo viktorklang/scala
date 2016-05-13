@@ -44,52 +44,51 @@ private[concurrent] trait BatchingExecutor extends Executor {
   // invariant: if "_tasksLocal.get ne null" then we are inside BatchingRunnable.run; if it is null, we are outside
   private val _tasksLocal = new ThreadLocal[List[Runnable]]()
 
-  private class Batch(val initial: List[Runnable]) extends Runnable with BlockContext {
+  private class Batch(val initial: List[Runnable]) extends Runnable with BlockContext with (BlockContext => Unit) {
     private var parentBlockContext: BlockContext = _
     // this method runs in the delegate ExecutionContext's thread
-    override def run(): Unit = {
+    override def run(): Unit = BlockContext.usingBlockContext(this)(BlockContext.current)(this)
+
+    override def apply(prevBlockContext: BlockContext): Unit = {
       require(_tasksLocal.get eq null)
+      try {
+        parentBlockContext = prevBlockContext
 
-      val prevBlockContext = BlockContext.current
-      BlockContext.withBlockContext(this) {
-        try {
-          parentBlockContext = prevBlockContext
-
-          @tailrec def processBatch(batch: List[Runnable]): Unit = batch match {
-            case Nil => ()
-            case head :: tail =>
-              _tasksLocal set tail
-              try {
-                head.run()
-              } catch {
-                case t: Throwable =>
-                  // if one task throws, move the
-                  // remaining tasks to another thread
-                  // so we can throw the exception
-                  // up to the invoking executor
-                  val remaining = _tasksLocal.get
-                  _tasksLocal set Nil
-                  unbatchedExecute(new Batch(remaining)) //TODO what if this submission fails?
-                  throw t // rethrow
-              }
-              processBatch(_tasksLocal.get) // since head.run() can add entries, always do _tasksLocal.get here
-          }
-
-          processBatch(initial)
-        } finally {
-          _tasksLocal.remove()
-          parentBlockContext = null
+        @tailrec def processBatch(batch: List[Runnable]): Unit = batch match {
+          case Nil => ()
+          case head :: tail =>
+            _tasksLocal set tail
+            try {
+              head.run()
+            } catch {
+              case t: Throwable =>
+                // if one task throws, move the
+                // remaining tasks to another thread
+                // so we can throw the exception
+                // up to the invoking executor
+                val remaining = _tasksLocal.get
+                _tasksLocal set Nil
+                unbatchedExecute(new Batch(remaining)) //TODO what if this submission fails?
+                throw t // rethrow
+            }
+            processBatch(_tasksLocal.get) // since head.run() can add entries, always do _tasksLocal.get here
         }
+
+        processBatch(initial)
+      } finally {
+        _tasksLocal.remove()
+        parentBlockContext = null
       }
     }
 
     override def blockOn[T](thunk: => T)(implicit permission: CanAwait): T = {
       // if we know there will be blocking, we don't want to keep tasks queued up because it could deadlock.
       {
-        val tasks = _tasksLocal.get
-        _tasksLocal set Nil
-        if ((tasks ne null) && tasks.nonEmpty)
-          unbatchedExecute(new Batch(tasks))
+        _tasksLocal.get match {
+          case Nil  => ()
+          case null => _tasksLocal.set(Nil)
+          case some => _tasksLocal.set(Nil); unbatchedExecute(new Batch(some))
+        }
       }
 
       // now delegate the blocking to the previous BC
