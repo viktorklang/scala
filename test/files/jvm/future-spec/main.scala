@@ -71,14 +71,11 @@ trait MinimalScalaTest extends Output with Features {
   }
 
   def intercept[T <: Throwable: Manifest](body: =>Any): T = {
-    try {
-      body
-      throw new Exception("Exception of type %s was not thrown".format(manifest[T]))
-    } catch {
-      case t: Throwable =>
-        if (manifest[T].runtimeClass != t.getClass) throw t
-        else t.asInstanceOf[T]
+    try body catch {
+      case t: Throwable if (manifest[T].runtimeClass.isAssignableFrom(t.getClass)) =>
+        return t.asInstanceOf[T]
     }
+    throw new Exception("Exception of type %s was not thrown".format(manifest[T]))
   }
 
   def checkType[T: Manifest, S](in: Future[T], refmanifest: Manifest[S]): Boolean = manifest[T] == refmanifest
