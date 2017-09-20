@@ -69,12 +69,6 @@ private[concurrent] object Promise {
       override final def toString: String = Promise.toString(future)
     }
 
-  final def transformWithImpl[T, S](future: Future[T], f: Try[T] => Future[S])(implicit ec: ExecutionContext): Future[S] = {
-    val p = transformWithDefaultPromise(f)
-    future.onComplete(p)
-    p.future
-  }
-
   final def transformImpl[T, S](future: Future[T], f: Try[T] => Try[S])(implicit ec: ExecutionContext): Future[S] = {
     val p = transformDefaultPromise(f)
     future.onComplete(p)
@@ -185,19 +179,34 @@ private[concurrent] object Promise {
    */
   // Left non-final to enable addition of extra fields by Java/Scala converters
   // in scala-java8-compat.
-  class DefaultPromise[T] private (init: AnyRef) extends AtomicReference[AnyRef](init) with scala.concurrent.Promise[T] with scala.concurrent.Future[T] {
+  class DefaultPromise[T] private[this] (init: AnyRef) extends AtomicReference[AnyRef](init) with scala.concurrent.Promise[T] with scala.concurrent.Future[T] {
 
+    /**
+     * Constructs a new, uncompleted, Promise.
+     */
     def this() = this(Nil)
 
-    def this(result: Try[T]) = this(result: AnyRef)
+    /**
+     * Constructs a new, completed, Promise.
+     */
+    def this(result: Try[T]) = this(resolveTry(result): AnyRef)
 
+    /**
+     * Returns the associaed `Future` with this `Promise`
+     */
     override def future: Future[T] = this
 
-    override def transform[S](f: Try[T] => Try[S])(implicit executor: ExecutionContext): Future[S] =
-      transformImpl(future, f)
+    override def transform[S](f: Try[T] => Try[S])(implicit executor: ExecutionContext): Future[S] = {
+      val p = Promise.transformDefaultPromise(f)
+      onComplete(p)
+      p.future
+    }
 
-    override def transformWith[S](f: Try[T] => Future[S])(implicit executor: ExecutionContext): Future[S] =
-      transformWithImpl(future, f)
+    override def transformWith[S](f: Try[T] => Future[S])(implicit executor: ExecutionContext): Future[S] = {
+      val p = transformWithDefaultPromise(f)
+      onComplete(p)
+      p.future
+    }
 
     override def toString: String = scala.concurrent.impl.Promise.toString(this: Future[T])
 
@@ -217,18 +226,18 @@ private[concurrent] object Promise {
      */
     private def compressedRoot(): DefaultPromise[T] =
       get() match {
-        case linked: DefaultPromise[_] => compressedRoot(linked)
+        case linked: DefaultPromise[T @unchecked] => compressedRoot(linked)
         case _ => this
       }
 
     @tailrec
-    private[this] final def compressedRoot(linked: DefaultPromise[_]): DefaultPromise[T] = {
-      val target = linked.asInstanceOf[DefaultPromise[T]].root
+    private[this] final def compressedRoot(linked: DefaultPromise[T]): DefaultPromise[T] = {
+      val target = linked.root
       if (linked eq target) target
       else if (compareAndSet(linked, target)) target
       else {
         get() match {
-          case newLinked: DefaultPromise[_] => compressedRoot(newLinked)
+          case newLinked: DefaultPromise[T @unchecked] => compressedRoot(newLinked)
           case _ => this
         }
       }
@@ -241,7 +250,7 @@ private[concurrent] object Promise {
     @tailrec
     private def root: DefaultPromise[T] =
       get() match {
-        case linked: DefaultPromise[_] => linked.asInstanceOf[DefaultPromise[T]].root
+        case linked: DefaultPromise[T @unchecked] => linked.root
         case _ => this
       }
 
@@ -281,8 +290,8 @@ private[concurrent] object Promise {
 
     @tailrec
     private def value0: Option[Try[T]] = get() match {
-      case c: Try[_] => Some(c.asInstanceOf[Try[T]])
-      case dp: DefaultPromise[_] => compressedRoot(dp).value0
+      case c: Try[T @unchecked] => Some(c)
+      case dp: DefaultPromise[T @unchecked] => compressedRoot(dp).value0
       case _ => None
     }
 
@@ -291,7 +300,7 @@ private[concurrent] object Promise {
     @tailrec
     private def isCompleted0: Boolean = get() match {
       case _: Try[_] => true
-      case dp: DefaultPromise[_] => compressedRoot(dp).isCompleted0
+      case dp: DefaultPromise[T @unchecked] => compressedRoot(dp).isCompleted0
       case _ => false
     }
 
@@ -310,10 +319,9 @@ private[concurrent] object Promise {
     @tailrec
     private def tryCompleteAndGetListeners(v: Try[T]): List[CallbackRunnable[T]] = {
       get() match {
-        case raw: List[_] =>
-          val cur = raw.asInstanceOf[List[CallbackRunnable[T]]]
+        case cur: List[CallbackRunnable[T] @unchecked] =>
           if (compareAndSet(cur, v)) cur else tryCompleteAndGetListeners(v)
-        case dp: DefaultPromise[_] => compressedRoot(dp).tryCompleteAndGetListeners(v)
+        case dp: DefaultPromise[T @unchecked] => compressedRoot(dp).tryCompleteAndGetListeners(v)
         case _ => null
       }
     }
@@ -328,10 +336,10 @@ private[concurrent] object Promise {
     @tailrec
     private def dispatchOrAddCallback(runnable: CallbackRunnable[T]): Unit = {
       get() match {
-        case r: Try[_]          => runnable.executeWithValue(r.asInstanceOf[Try[T]])
-        case dp: DefaultPromise[_] => compressedRoot(dp).dispatchOrAddCallback(runnable)
-        case listeners: List[_] => if (compareAndSet(listeners, runnable :: listeners)) ()
-                                   else dispatchOrAddCallback(runnable)
+        case r: Try[T @unchecked]             => runnable.executeWithValue(r)
+        case dp: DefaultPromise[T @unchecked] => compressedRoot(dp).dispatchOrAddCallback(runnable)
+        case listeners: List[_]               => if (compareAndSet(listeners, runnable :: listeners)) ()
+                                                 else dispatchOrAddCallback(runnable)
       }
     }
 
@@ -352,14 +360,14 @@ private[concurrent] object Promise {
     @tailrec
     private def link(target: DefaultPromise[T]): Unit = if (this ne target) {
       get() match {
-        case r: Try[_] =>
-          if (!target.tryComplete(r.asInstanceOf[Try[T]]))
+        case r: Try[T @unchecked] =>
+          if (!target.tryComplete(r))
             throw new IllegalStateException("Cannot link completed promises together")
-        case dp: DefaultPromise[_] =>
+        case dp: DefaultPromise[T @unchecked] =>
           compressedRoot(dp).link(target)
-        case listeners: List[_] if compareAndSet(listeners, target) =>
+        case listeners: List[CallbackRunnable[T] @unchecked] if compareAndSet(listeners, target) =>
           if (listeners.nonEmpty)
-            listeners.asInstanceOf[List[CallbackRunnable[T]]].foreach(target.dispatchOrAddCallback(_))
+            listeners.foreach(target.dispatchOrAddCallback(_))
         case _ =>
           link(target)
       }
@@ -371,7 +379,7 @@ private[concurrent] object Promise {
    *  Useful in Future-composition when a value to contribute is already available.
    */
   object KeptPromise {
-    def apply[T](result: Try[T]): scala.concurrent.Promise[T] = new DefaultPromise(resolveTry(result))
+    def apply[T](result: Try[T]): scala.concurrent.Promise[T] = new DefaultPromise(result)
   }
 
 }
