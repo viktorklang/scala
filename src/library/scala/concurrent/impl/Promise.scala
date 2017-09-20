@@ -185,7 +185,11 @@ private[concurrent] object Promise {
    */
   // Left non-final to enable addition of extra fields by Java/Scala converters
   // in scala-java8-compat.
-  class DefaultPromise[T] extends AtomicReference[AnyRef](Nil) with scala.concurrent.Promise[T] with scala.concurrent.Future[T] {
+  class DefaultPromise[T] private (init: AnyRef) extends AtomicReference[AnyRef](init) with scala.concurrent.Promise[T] with scala.concurrent.Future[T] {
+
+    def this() = this(Nil)
+
+    def this(result: Try[T]) = this(result: AnyRef)
 
     override def future: Future[T] = this
 
@@ -367,71 +371,7 @@ private[concurrent] object Promise {
    *  Useful in Future-composition when a value to contribute is already available.
    */
   object KeptPromise {
-    import scala.concurrent.{Future, Promise}
-    import scala.concurrent.Future.coerce
-    import scala.reflect.ClassTag
-
-    private[this] final class Successful[T](final val result: Success[T]) extends Promise[T] with Future[T] {
-      override final def future: Future[T] = this
-
-      override final def toString: String = scala.concurrent.impl.Promise.toString(this: Future[T])
-
-      override final def value: Option[Try[T]] = Some(result)
-      override final def isCompleted: Boolean = true
-      override final def tryComplete(value: Try[T]): Boolean = false
-      override final def onComplete[U](func: Try[T] => U)(implicit executor: ExecutionContext): Unit =
-        (new CallbackRunnable(executor.prepare(), func)).executeWithValue(result)
-
-      override final def ready(atMost: Duration)(implicit permit: CanAwait): this.type = this
-      override final def result(atMost: Duration)(implicit permit: CanAwait): T = result.get
-
-      override final def transform[S](f: Try[T] => Try[S])(implicit executor: ExecutionContext): Future[S] = transformImpl(future, f)
-      override final def transformWith[S](f: Try[T] => Future[S])(implicit executor: ExecutionContext): Future[S] = transformWithImpl(future, f)
-
-      override final def onFailure[U](pf: PartialFunction[Throwable, U])(implicit executor: ExecutionContext): Unit = ()
-      override final def failed: Future[Throwable] = KeptPromise(Failure(new NoSuchElementException("Future.failed not completed with a throwable."))).future
-      override final def recover[U >: T](pf: PartialFunction[Throwable, U])(implicit executor: ExecutionContext): Future[U] = this
-      override final def recoverWith[U >: T](pf: PartialFunction[Throwable, Future[U]])(implicit executor: ExecutionContext): Future[U] = this
-      override final def fallbackTo[U >: T](that: Future[U]): Future[U] = this
-    }
-
-    private[this] final class Failed[T](final val result: Failure[T]) extends Promise[T] with Future[T] {
-      override final def future: Future[T] = this
-
-      override final def toString: String = scala.concurrent.impl.Promise.toString(this: Future[T])
-
-      override final def transform[S](f: Try[T] => Try[S])(implicit executor: ExecutionContext): Future[S] = transformImpl(future, f)
-      override final def transformWith[S](f: Try[T] => Future[S])(implicit executor: ExecutionContext): Future[S] = transformWithImpl(future, f)
-
-      override final def value: Option[Try[T]] = Some(result)
-      override final def isCompleted: Boolean = true
-      override final def tryComplete(value: Try[T]): Boolean = false
-      override final def onComplete[U](func: Try[T] => U)(implicit executor: ExecutionContext): Unit =
-        (new CallbackRunnable(executor.prepare(), func)).executeWithValue(result)
-
-      override final def ready(atMost: Duration)(implicit permit: CanAwait): this.type = this
-      override final def result(atMost: Duration)(implicit permit: CanAwait): T = result.get
-
-      override final def onSuccess[U](pf: PartialFunction[T, U])(implicit executor: ExecutionContext): Unit = ()
-      override final def failed: Future[Throwable] = KeptPromise(Success(result.exception)).future
-      override final def foreach[U](f: T => U)(implicit executor: ExecutionContext): Unit = ()
-      override final def map[S](f: T => S)(implicit executor: ExecutionContext): Future[S] = coerce(future)
-      override final def flatMap[S](f: T => Future[S])(implicit executor: ExecutionContext): Future[S] = coerce(future)
-      override final def flatten[S](implicit ev: T <:< Future[S]): Future[S] = coerce(future)
-      override final def filter(p: T => Boolean)(implicit executor: ExecutionContext): Future[T] = this
-      override final def collect[S](pf: PartialFunction[T, S])(implicit executor: ExecutionContext): Future[S] = coerce(future)
-      override final def zip[U](that: Future[U]): Future[(T, U)] = coerce(future)
-      override final def zipWith[U, R](that: Future[U])(f: (T, U) => R)(implicit executor: ExecutionContext): Future[R] = coerce(future)
-      override final def fallbackTo[U >: T](that: Future[U]): Future[U] =
-        if (this eq that) this else that.recoverWith({ case _ => this })(InternalCallbackExecutor)
-      override final def mapTo[S](implicit tag: ClassTag[S]): Future[S] = coerce(future)
-    }
-
-    def apply[T](result: Try[T]): scala.concurrent.Promise[T] =
-      resolveTry(result) match {
-        case s: Success[_] => new Successful(coerce(s))
-        case f: Failure[_] => new Failed(coerce(f))
-      }
+    def apply[T](result: Try[T]): scala.concurrent.Promise[T] = new DefaultPromise(resolveTry(result))
   }
 
 }
