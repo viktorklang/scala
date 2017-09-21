@@ -48,17 +48,18 @@ private[concurrent] object Promise {
     }
 
   private final def resolveTry[T](source: Try[T]): Try[T] = source match {
-    case Failure(t) => resolver(t)
-    case _          => source
+    case f @ Failure(throwable) =>
+      throwable match {
+        case t: scala.runtime.NonLocalReturnControl[_] => Success(t.value.asInstanceOf[T])
+        case t: scala.util.control.ControlThrowable    => Failure(new ExecutionException("Boxed ControlThrowable", t))
+        case t: InterruptedException                   => Failure(new ExecutionException("Boxed InterruptedException", t))
+        case e: Error                                  => Failure(new ExecutionException("Boxed Error", e))
+        case _                                         => f
+      }
+    case _ => source
   }
 
-  private final def resolver[T](throwable: Throwable): Try[T] = throwable match {
-    case t: scala.runtime.NonLocalReturnControl[_] => Success(t.value.asInstanceOf[T])
-    case t: scala.util.control.ControlThrowable    => Failure(new ExecutionException("Boxed ControlThrowable", t))
-    case t: InterruptedException                   => Failure(new ExecutionException("Boxed InterruptedException", t))
-    case e: Error                                  => Failure(new ExecutionException("Boxed Error", e))
-    case t                                         => Failure(t)
-  }
+  
 
   final def transformWithDefaultPromise[T, S](f: Try[T] => Future[S]): DefaultPromise[S] with (Try[T] => Unit) =
    new DefaultPromise[S] with (Try[T] => Unit) {
@@ -375,8 +376,12 @@ private[concurrent] object Promise {
         case dp: DefaultPromise[T @unchecked] =>
           compressedRoot(dp).link(target)
         case listeners: List[CallbackRunnable[T] @unchecked] if compareAndSet(listeners, target) =>
-          if (listeners.nonEmpty)
-            listeners.foreach(target.dispatchOrAddCallback(_))
+          @tailrec def dispatch(rest: List[CallbackRunnable[T]], target: DefaultPromise[T]): Unit =
+            if (rest ne Nil) {
+              target.dispatchOrAddCallback(rest.head)
+              dispatch(rest.tail, target)
+            }
+          dispatch(listeners, target)
         case _ =>
           link(target)
       }

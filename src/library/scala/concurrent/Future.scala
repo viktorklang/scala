@@ -485,7 +485,13 @@ trait Future[+T] extends Awaitable[T] {
     if (this eq that) this
     else {
       implicit val ec = internalExecutor
-      recoverWith { case _ => that recoverWith { case _ => this } }
+      transformWith {
+        case Success(_) => this
+        case original @ Failure(_) => that transform {
+          case fallback @ Success(_) => fallback
+          case Failure(_) => original
+        }
+      }
     }
 
   /** Creates a new `Future[S]` which is completed with this `Future`'s result if
