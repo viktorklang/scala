@@ -26,12 +26,16 @@ private final class CallbackRunnable[T](final val executor: ExecutionContext, fi
   override final def run(): Unit = if (value ne null) // must set value to non-null before running!
     try onComplete(value) catch { case NonFatal(e) => executor reportFailure e }
 
-  final def executeWithValue(v: Try[T]): Unit =
+  /**
+   * returns false if this CallbackRunnable already had a value, false if not.
+   */
+  final def executeWithValue(v: Try[T]): Boolean =
     if (value eq null) {
       value = v
       // Note that we cannot prepare the ExecutionContext at this point, since we might already be running on a different thread!
       try executor.execute(this) catch { case NonFatal(t) => executor reportFailure t }
-    }
+      true
+    } else false
 }
 
 private[concurrent] object Promise {
@@ -306,10 +310,15 @@ private[concurrent] object Promise {
 
     final def tryComplete(value: Try[T]): Boolean = {
       val resolved = resolveTry(value)
-      tryCompleteAndGetListeners(resolved) match {
-        case null             => false
-        case rs if rs.isEmpty => true
-        case rs               => rs.foreach(r => r.executeWithValue(resolved)); true
+      var listeners = tryCompleteAndGetListeners(resolved)
+      if (listeners eq null) false
+      else {
+         while(listeners ne Nil) {
+          val cur = listeners
+          listeners = cur.tail
+          cur.head.executeWithValue(resolved)
+         }
+        true
       }
     }
 
