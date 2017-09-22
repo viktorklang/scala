@@ -38,40 +38,37 @@ private final class CallbackRunnable[T](final val executor: ExecutionContext, fi
     } else false
 }
 
-private[concurrent] object Promise {
-  import scala.concurrent.Future.coerce
+private[concurrent] final object Promise {
+  private[this] final def executionFailure[T](msg: String, cause: Throwable): Failure[T] =
+    Failure(new ExecutionException(msg, cause))
 
-  private final def toString(f: Future[_]): String =
-    f.value match {
-      case Some(result) => "Future("+result+")"
-      case None => "Future(<not completed>)"
+  private[this] final def resolveFailure[T](f: Failure[T]): Try[T] =
+    f.exception match {
+      case t: scala.runtime.NonLocalReturnControl[T @unchecked] => Success(t.value)
+      case t: scala.util.control.ControlThrowable    => executionFailure("Boxed ControlThrowable", t)
+      case t: InterruptedException                   => executionFailure("Boxed InterruptedException", t)
+      case e: Error                                  => executionFailure("Boxed Error", e)
+      case _                                         => f
     }
 
-  private final def resolveTry[T](source: Try[T]): Try[T] = source match {
-    case f @ Failure(throwable) =>
-      throwable match {
-        case t: scala.runtime.NonLocalReturnControl[_] => Success(t.value.asInstanceOf[T])
-        case t: scala.util.control.ControlThrowable    => Failure(new ExecutionException("Boxed ControlThrowable", t))
-        case t: InterruptedException                   => Failure(new ExecutionException("Boxed InterruptedException", t))
-        case e: Error                                  => Failure(new ExecutionException("Boxed Error", e))
-        case _                                         => f
-      }
-    case _ => source
-  }
-
-  
+  private final def resolveTry[T](source: Try[T]): Try[T] = 
+    source match {
+      case null    => throw new IllegalArgumentException("Cannot complete a Promise with `null`")
+      case f: Failure[T @unchecked] => resolveFailure(f)
+      case _ => source
+    }
 
   final def transformWithDefaultPromise[T, S](f: Try[T] => Future[S]): DefaultPromise[S] with (Try[T] => Unit) =
    new DefaultPromise[S] with (Try[T] => Unit) {
       private[this] var fun = f
-      override def apply(v: Try[T]): Unit = if (fun ne null) {
+      override final def apply(v: Try[T]): Unit = if (fun ne null) {
         try fun(v) match {
-          case fut if fut eq this => complete(Future.coerce(v))
+          case fut if fut eq this => complete(Future.coerce(v)) // TODO sensible?
           case dp: DefaultPromise[S @unchecked] => dp.linkRootOf(this) // If possible, link DefaultPromises to avoid space leaks
           case fut => this completeWith fut
         } catch { case NonFatal(t) => this failure t } finally { fun = null }
       }
-      override final def toString: String = Promise.toString(future)
+      override final def toString: String = super[DefaultPromise].toString
     }
 
   final def transformImpl[T, S](future: Future[T], f: Try[T] => Try[S])(implicit ec: ExecutionContext): Future[S] = {
@@ -83,9 +80,9 @@ private[concurrent] object Promise {
   final def transformDefaultPromise[T, S](f: Try[T] => Try[S]): DefaultPromise[S] with (Try[T] => Unit) =
     new DefaultPromise[S] with (Try[T] => Unit) {
       private[this] var fun = f
-      override def apply(result: Try[T]): Unit = 
+      override final def apply(result: Try[T]): Unit = 
         if (fun ne null) this.complete(try fun(result) catch { case NonFatal(t) => Failure(t) } finally { fun = null })
-      override final def toString: String = Promise.toString(future)
+      override final def toString: String = super[DefaultPromise].toString
     }
 
    /**
@@ -213,7 +210,13 @@ private[concurrent] object Promise {
       p.future
     }
 
-    override def toString: String = scala.concurrent.impl.Promise.toString(this: Future[T])
+    override def toString: String = toString0
+
+    @tailrec private final def toString0: String = get() match {
+      case c: Try[T @unchecked] => s"Future($c)"
+      case dp: DefaultPromise[T @unchecked] => compressedRoot(dp).toString0
+      case _ => "Future(<not completed>)"
+    }
 
     /** Get the root promise for this promise, compressing the link chain to that
      *  promise if necessary.
@@ -288,28 +291,23 @@ private[concurrent] object Promise {
       else throw new TimeoutException("Future timed out after [" + atMost + "]")
 
     @throws(classOf[Exception])
-    final def result(atMost: Duration)(implicit permit: CanAwait): T =
-      ready(atMost).value.get.get // ready throws TimeoutException if timeout so value.get is safe here
+    final def result(atMost: Duration)(implicit permit: CanAwait): T = {
+      ready(atMost) // ready throws TimeoutException if timeout so value.get is safe here
+      value0.get
+    }
 
-    def value: Option[Try[T]] = value0
+    override final def isCompleted: Boolean = value0 ne null
+
+    override def value: Option[Try[T]] = Option(value0)
 
     @tailrec
-    private def value0: Option[Try[T]] = get() match {
-      case c: Try[T @unchecked] => Some(c)
+    private def value0: Try[T] = get() match {
+      case c: Try[T @unchecked] => c
       case dp: DefaultPromise[T @unchecked] => compressedRoot(dp).value0
-      case _ => None
+      case _ => null
     }
 
-    override final def isCompleted: Boolean = isCompleted0
-
-    @tailrec
-    private def isCompleted0: Boolean = get() match {
-      case _: Try[_] => true
-      case dp: DefaultPromise[T @unchecked] => compressedRoot(dp).isCompleted0
-      case _ => false
-    }
-
-    final def tryComplete(value: Try[T]): Boolean = {
+    override final def tryComplete(value: Try[T]): Boolean = {
       val resolved = resolveTry(value)
       var listeners = tryCompleteAndGetListeners(resolved)
       if (listeners eq null) false
@@ -392,8 +390,8 @@ private[concurrent] object Promise {
    *
    *  Useful in Future-composition when a value to contribute is already available.
    */
-  object KeptPromise {
-    def apply[T](result: Try[T]): scala.concurrent.Promise[T] = new DefaultPromise(result)
+  final object KeptPromise {
+    final def apply[T](result: Try[T]): scala.concurrent.Promise[T] = new DefaultPromise(result)
   }
 
 }
