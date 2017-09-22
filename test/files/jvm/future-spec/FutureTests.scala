@@ -30,6 +30,20 @@ class FutureTests extends MinimalScalaTest {
     t
   }
 
+  def LogicNotCalled[T](f: ExecutionContext => T): T = {
+    val p = Promise[Runnable]()
+    val unusedEC: ExecutionContext = new ExecutionContext {
+      def execute(r: Runnable) = r.run()
+      def reportFailure(t: Throwable): Unit = p.tryFailure(t)
+    }
+    val t = f(unusedEC)
+    p.future.value match {
+      case Some(Failure(f)) => throw f
+      case _ =>
+    }
+    t
+  }
+
   val defaultTimeout = 5 seconds
 
   /* future specification */
@@ -114,7 +128,7 @@ class FutureTests extends MinimalScalaTest {
       ECNotUsed(ec => f.onFailure({ case _ => fail("onFailure should not have been called") })(ec))
       assert( ECNotUsed(ec => f.recover({ case _ => fail("recover should not have been called")})(ec)) eq f)
       assert( ECNotUsed(ec => f.recoverWith({ case _ => fail("flatMap should not have been called")})(ec)) eq f)
-      assert(f.fallbackTo(f) eq f, "Future.fallbackTo must be the same instance as Future.fallbackTo")
+      assert(f.fallbackTo(f) eq f, "Future.fallbackTo must be the same instance as Future.fallbackTo")      
     }
 
     "have proper const representation for failure" in {
@@ -125,7 +139,7 @@ class FutureTests extends MinimalScalaTest {
       assert(f.zip(f) eq f, "Future.zip must be the same instance as Future.zip")
       assert(f.flatten eq f, "Future.flatten must be the same instance as Future.flatten")
       assert(f.failed.value == Some(Success(e)), "Future.failed.failed must become successful") // scala/bug#10034
-
+      
               ECNotUsed(ec => f.foreach(_ => fail("foreach should not have been called"))(ec))
               ECNotUsed(ec => f.onSuccess({ case _ => fail("onSuccess should not have been called") })(ec))
       assert( ECNotUsed(ec => f.map(_ => fail("map should not have been called"))(ec)) eq f)
