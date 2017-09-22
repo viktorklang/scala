@@ -577,7 +577,7 @@ object Future {
     classOf[Unit]    -> classOf[scala.runtime.BoxedUnit]
   )
 
-  private[concurrent] final def coerce[F[_],T,U](f: F[T]): F[U] = f.asInstanceOf[F[U]]
+  private[concurrent] final def coerce[F[_],A,B](f: F[A]): F[B] = f.asInstanceOf[F[B]]
 
   private[concurrent] final val collectFailed =
     (t: Any) => throw new NoSuchElementException("Future.collect partial function is not defined at: " + t) with NoStackTrace

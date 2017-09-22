@@ -190,6 +190,66 @@ private[concurrent] final object Promise {
       p.future
     }
 
+    override def onFailure[U](@deprecatedName('callback) pf: PartialFunction[Throwable, U])(implicit executor: ExecutionContext): Unit =
+      value0 match {
+        case null | Failure(_) => super[Future].onFailure(pf)
+        case _ => ()
+      }
+
+    override def onSuccess[U](pf: PartialFunction[T, U])(implicit executor: ExecutionContext): Unit =
+      value0 match {
+        case null | Success(_) => super[Future].onSuccess(pf)
+        case _ => ()
+      }
+
+    override def foreach[U](f: T => U)(implicit executor: ExecutionContext): Unit =
+      value0 match {
+        case null | Success(_) => super[Future].foreach(f)
+        case _ => ()
+      }
+
+    override def flatMap[S](f: T => Future[S])(implicit executor: ExecutionContext): Future[S] = 
+      value0 match {
+        case null | Success(_) => super[Future].flatMap(f)
+        case _ => Future.coerce(this)
+      }
+
+    override def map[S](f: T => S)(implicit executor: ExecutionContext): Future[S] =
+      value0 match {
+        case null | Success(_) => super[Future].map(f)
+        case _ => Future.coerce(this)
+      }
+
+    override def filter(@deprecatedName('pred) p: T => Boolean)(implicit executor: ExecutionContext): Future[T] =
+      value0 match {
+        case null | Success(_) => super[Future].filter(p)
+        case _ => Future.coerce(this)
+      }
+
+    override def collect[S](pf: PartialFunction[T, S])(implicit executor: ExecutionContext): Future[S] =
+      value0 match {
+        case null | Success(_) => super[Future].collect(pf)
+        case _ => Future.coerce(this)
+      }
+
+    override def recoverWith[U >: T](pf: PartialFunction[Throwable, Future[U]])(implicit executor: ExecutionContext): Future[U] =
+      value0 match {
+        case null | Failure(_) => super[Future].recoverWith(pf)
+        case _ => Future.coerce(this)
+      }
+
+    override def recover[U >: T](pf: PartialFunction[Throwable, U])(implicit executor: ExecutionContext): Future[U] =
+      value0 match {
+        case null | Failure(_) => super[Future].recover(pf)
+        case _ => Future.coerce(this)
+      }
+
+    override def mapTo[S](implicit tag: scala.reflect.ClassTag[S]): Future[S] =
+      value0 match {
+        case Failure(_) => Future.coerce(this)
+        case _ => super[Future].mapTo[S](tag)
+      }
+
     override def toString: String = toString0
 
     @tailrec private final def toString0: String = get() match {
