@@ -115,9 +115,7 @@ trait Future[+T] extends Awaitable[T] {
    */
   @deprecated("use `foreach` or `onComplete` instead (keep in mind that they take total rather than partial functions)", "2.12.0")
   def onSuccess[U](pf: PartialFunction[T, U])(implicit executor: ExecutionContext): Unit = onComplete {
-    case Success(v) =>
-      pf.applyOrElse[T, Any](v, Predef.identity[T]) // Exploiting the cached function to avoid MatchError
-    case _ =>
+    t => if (t.isInstanceOf[Success[T]]) pf.applyOrElse[T, Any](t.asInstanceOf[Success[T]].value, Future.id[T])
   }
 
   /** When this future is completed with a failure (i.e., with a throwable),
@@ -140,9 +138,7 @@ trait Future[+T] extends Awaitable[T] {
    */
   @deprecated("use `onComplete` or `failed.foreach` instead (keep in mind that they take total rather than partial functions)", "2.12.0")
   def onFailure[U](@deprecatedName('callback) pf: PartialFunction[Throwable, U])(implicit executor: ExecutionContext): Unit = onComplete {
-    case Failure(t) =>
-      pf.applyOrElse[Throwable, Any](t, Predef.identity[Throwable]) // Exploiting the cached function to avoid MatchError
-    case _ =>
+      t => if(t.isFailure) pf.applyOrElse[Throwable, Any](t.asInstanceOf[Failure[_]].exception, Future.id[Throwable])
   }
 
   /** When this future is completed, either through an exception, or a value,
@@ -205,8 +201,9 @@ trait Future[+T] extends Awaitable[T] {
    */
   def failed: Future[Throwable] =
     transform({
-      case Failure(t) => Success(t)
-      case Success(v) => Future.failedFailure
+      t =>
+        if (t.isInstanceOf[Failure[T]]) Success(t.asInstanceOf[Failure[T]].exception)
+        else Future.failedFailure
     })(internalExecutor)
 
 
@@ -238,8 +235,9 @@ trait Future[+T] extends Awaitable[T] {
    */
   def transform[S](s: T => S, f: Throwable => Throwable)(implicit executor: ExecutionContext): Future[S] =
     transform {
-      case result @ Success(_) => result map s
-      case Failure(t) => throw f(t) // will throw fatal errors!
+      t => 
+        if (t.isInstanceOf[Success[T]]) t map s
+        else throw f(t.asInstanceOf[Failure[T]].exception) // will throw fatal errors!
     }
 
   /** Creates a new Future by applying the specified function to the result
@@ -301,8 +299,9 @@ trait Future[+T] extends Awaitable[T] {
    * @group Transformations
    */
   def flatMap[S](f: T => Future[S])(implicit executor: ExecutionContext): Future[S] = transformWith {
-    case Success(s) => f(s)
-    case Failure(_) => Future.coerce(this) // Safe cast
+    t => 
+      if(t.isInstanceOf[Success[T]]) f(t.asInstanceOf[Success[T]].value)
+      else Future.coerce(this) // Safe cast
   }
 
   /** Creates a new future with one level of nesting flattened, this method is equivalent
@@ -335,10 +334,11 @@ trait Future[+T] extends Awaitable[T] {
    */
   def filter(@deprecatedName('pred) p: T => Boolean)(implicit executor: ExecutionContext): Future[T] =
     transform {
-      case s @ Success(v) =>
-       if (p(v)) s
-       else Future.filterFailure
-      case f @ Failure(_) => f
+      t =>
+        if (t.isInstanceOf[Success[T]]) {
+          if (p(t.asInstanceOf[Success[T]].value)) t
+          else Future.filterFailure
+        } else t
     }
 
   /** Used by for-comprehensions.
@@ -373,8 +373,10 @@ trait Future[+T] extends Awaitable[T] {
    */
   def collect[S](pf: PartialFunction[T, S])(implicit executor: ExecutionContext): Future[S] =
     transform {
-      case Success(r) => Success(pf.applyOrElse(r, Future.collectFailed))
-      case f: Failure[_] => Future.coerce(f)
+      t =>
+        if (t.isInstanceOf[Success[T]])
+          Success(pf.applyOrElse(t.asInstanceOf[Success[T]].value, Future.collectFailed))
+        else Future.coerce(t)
     }
 
   /** Creates a new future that will handle any matching throwable that this
@@ -417,13 +419,12 @@ trait Future[+T] extends Awaitable[T] {
    */
   def recoverWith[U >: T](pf: PartialFunction[Throwable, Future[U]])(implicit executor: ExecutionContext): Future[U] =
     transformWith {
-      case Failure(t) => 
-        val result = pf.applyOrElse(t, Future.recoverWithFailed)
-        if (result ne Future.recoverWithFailedMarker)
-          result
-        else
-          this
-      case Success(_) => this
+      t =>
+        if (t.isInstanceOf[Failure[T]]) {
+          val result = pf.applyOrElse(t.asInstanceOf[Failure[T]].exception, Future.recoverWithFailed)
+          if (result ne Future.recoverWithFailedMarker) result
+          else this
+        } else this
     }
 
   /** Zips the values of `this` and `that` future, and creates
@@ -486,11 +487,9 @@ trait Future[+T] extends Awaitable[T] {
     else {
       implicit val ec = internalExecutor
       transformWith {
-        case Success(_) => this
-        case original @ Failure(_) => that transform {
-          case fallback @ Success(_) => fallback
-          case Failure(_) => original
-        }
+        t =>
+          if (t.isInstanceOf[Success[T]]) this
+          else that transform { tt => if (tt.isInstanceOf[Success[U]]) tt else t }
       }
     }
 
@@ -545,7 +544,7 @@ trait Future[+T] extends Awaitable[T] {
   def andThen[U](pf: PartialFunction[Try[T], U])(implicit executor: ExecutionContext): Future[T] =
     transform {
       result =>
-        try pf.applyOrElse[Try[T], Any](result, Predef.identity[Try[T]])
+        try pf.applyOrElse[Try[T], Any](result, Future.id[Try[T]])
         catch { case NonFatal(t) => executor reportFailure t }
 
         result
@@ -576,6 +575,10 @@ object Future {
     classOf[Double]  -> classOf[java.lang.Double],
     classOf[Unit]    -> classOf[scala.runtime.BoxedUnit]
   )
+
+  private[this] final val _cachedId: AnyRef => AnyRef = Predef.identity _
+
+  private[concurrent] final def id[T]: T => T = _cachedId.asInstanceOf[T => T]
 
   private[concurrent] final def coerce[F[_],A,B](f: F[A]): F[B] = f.asInstanceOf[F[B]]
 
@@ -650,7 +653,7 @@ object Future {
 
   /** A Future which is always completed with the Unit value.
    */
-  val unit: Future[Unit] = successful(())
+  final val unit: Future[Unit] = successful(())
 
   /** Creates an already completed Future with the specified exception.
    *
@@ -694,8 +697,8 @@ object Future {
   */
   def apply[T](body: =>T)(implicit @deprecatedName('execctx) executor: ExecutionContext): Future[T] =
     unit.transform {
-      case Success(_) => Success(body)
-      case f: Failure[_] => Future.coerce(f)
+      r => if (r.isInstanceOf[Success[T @unchecked]]) Success(body)
+           else Future.coerce(r)
     }
 
   /** Simple version of `Future.traverse`. Asynchronously and non-blockingly transforms a `TraversableOnce[Future[A]]`
@@ -905,7 +908,7 @@ object Future {
   // by just not ever using it itself. scala.concurrent
   // doesn't need to create defaultExecutionContext as
   // a side effect.
-  private[concurrent] object InternalCallbackExecutor extends ExecutionContext with BatchingExecutor {
+  private[concurrent] final object InternalCallbackExecutor extends ExecutionContext with BatchingExecutor {
     override protected def unbatchedExecute(r: Runnable): Unit =
       r.run()
     override def reportFailure(t: Throwable): Unit =

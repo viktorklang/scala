@@ -190,72 +190,60 @@ private[concurrent] final object Promise {
       p.future
     }
 
-    override def onFailure[U](@deprecatedName('callback) pf: PartialFunction[Throwable, U])(implicit executor: ExecutionContext): Unit =
-      value0 match {
-        case null | Failure(_) => super[Future].onFailure(pf)
-        case _ => ()
-      }
+    private[this] final def failureOrUnknown: Boolean = {
+      val v = value0
+      ((v eq null) || v.isInstanceOf[Failure[T]])
+    }
 
-    override def onSuccess[U](pf: PartialFunction[T, U])(implicit executor: ExecutionContext): Unit =
-      value0 match {
-        case null | Success(_) => super[Future].onSuccess(pf)
-        case _ => ()
-      }
+    private[this] final def successOrUnknown: Boolean = {
+      val v = value0
+      ((v eq null) || v.isInstanceOf[Success[T]])
+    }
+
+    override def onFailure[U](@deprecatedName('callback) pf: PartialFunction[Throwable, U])(implicit executor: ExecutionContext): Unit =
+      if (failureOrUnknown) super[Future].onFailure(pf)
+
+    override def onSuccess[U](pf: PartialFunction[T, U])(implicit executor: ExecutionContext): Unit = 
+      if (successOrUnknown) super[Future].onSuccess(pf)
 
     override def foreach[U](f: T => U)(implicit executor: ExecutionContext): Unit =
-      value0 match {
-        case null | Success(_) => super[Future].foreach(f)
-        case _ => ()
-      }
+      if (successOrUnknown) super[Future].foreach(f)
 
     override def flatMap[S](f: T => Future[S])(implicit executor: ExecutionContext): Future[S] = 
-      value0 match {
-        case null | Success(_) => super[Future].flatMap(f)
-        case _ => Future.coerce(this)
-      }
+      if (successOrUnknown) super[Future].flatMap(f)
+      else Future.coerce(this)
 
     override def map[S](f: T => S)(implicit executor: ExecutionContext): Future[S] =
-      value0 match {
-        case null | Success(_) => super[Future].map(f)
-        case _ => Future.coerce(this)
-      }
+      if (successOrUnknown) super[Future].map(f)
+      else Future.coerce(this)
 
     override def filter(@deprecatedName('pred) p: T => Boolean)(implicit executor: ExecutionContext): Future[T] =
-      value0 match {
-        case null | Success(_) => super[Future].filter(p)
-        case _ => Future.coerce(this)
-      }
+      if (successOrUnknown) super[Future].filter(p)
+      else Future.coerce(this)
 
     override def collect[S](pf: PartialFunction[T, S])(implicit executor: ExecutionContext): Future[S] =
-      value0 match {
-        case null | Success(_) => super[Future].collect(pf)
-        case _ => Future.coerce(this)
-      }
+      if (successOrUnknown) super[Future].collect(pf)
+      else Future.coerce(this)
 
     override def recoverWith[U >: T](pf: PartialFunction[Throwable, Future[U]])(implicit executor: ExecutionContext): Future[U] =
-      value0 match {
-        case null | Failure(_) => super[Future].recoverWith(pf)
-        case _ => Future.coerce(this)
-      }
+      if (failureOrUnknown) super[Future].recoverWith(pf)
+      else Future.coerce(this)
 
     override def recover[U >: T](pf: PartialFunction[Throwable, U])(implicit executor: ExecutionContext): Future[U] =
-      value0 match {
-        case null | Failure(_) => super[Future].recover(pf)
-        case _ => Future.coerce(this)
-      }
+      if (failureOrUnknown) super[Future].recover(pf)
+      else Future.coerce(this)
 
     override def mapTo[S](implicit tag: scala.reflect.ClassTag[S]): Future[S] =
-      value0 match {
-        case Failure(_) => Future.coerce(this)
-        case _ => super[Future].mapTo[S](tag)
-      }
+      if (successOrUnknown) super[Future].mapTo[S](tag)
+      else Future.coerce(this)
 
     override def toString: String = toString0
 
-    @tailrec private final def toString0: String = get() match {
-      case c: Try[T @unchecked] => s"Future($c)"
-      case dp: DefaultPromise[T @unchecked] => compressedRoot(dp).toString0
-      case _ => "Future(<not completed>)"
+    @tailrec private final def toString0: String = {
+      val state = get()
+      if (state.isInstanceOf[Try[T]]) s"Future($state)"
+      else if (state.isInstanceOf[DefaultPromise[T]]) compressedRoot(state.asInstanceOf[DefaultPromise[T]]).toString0
+      else /*if (state.isInstanceOf[Callbacks[T]]) */ "Future(<not completed>)"
     }
 
     /** Get the root promise for this promise, compressing the link chain to that
@@ -272,22 +260,20 @@ private[concurrent] final object Promise {
      *  be garbage collected. Also, subsequent calls to this method should be
      *  faster as the link chain will be shorter.
      */
-    private def compressedRoot(): DefaultPromise[T] =
-      get() match {
-        case linked: DefaultPromise[T @unchecked] => compressedRoot(linked)
-        case _ => this
-      }
+    private def compressedRoot(): DefaultPromise[T] = {
+      val state = get()
+      if (state.isInstanceOf[DefaultPromise[T]]) compressedRoot(state.asInstanceOf[DefaultPromise[T]])
+      else this
+    }
 
     @tailrec
     private[this] final def compressedRoot(linked: DefaultPromise[T]): DefaultPromise[T] = {
       val target = linked.root
-      if (linked eq target) target
-      else if (compareAndSet(linked, target)) target
+      if ((linked eq target) || compareAndSet(linked, target)) target
       else {
-        get() match {
-          case newLinked: DefaultPromise[T @unchecked] => compressedRoot(newLinked)
-          case _ => this
-        }
+        val state = get()
+        if (state.isInstanceOf[DefaultPromise[T]]) compressedRoot(state.asInstanceOf[DefaultPromise[T]])
+        else this
       }
     }
 
@@ -296,11 +282,11 @@ private[concurrent] final object Promise {
      *  to compress the link chain whenever possible.
      */
     @tailrec
-    private def root: DefaultPromise[T] =
-      get() match {
-        case linked: DefaultPromise[T @unchecked] => linked.root
-        case _ => this
-      }
+    private def root: DefaultPromise[T] = {
+      val state = get()
+      if (state.isInstanceOf[DefaultPromise[T]]) state.asInstanceOf[DefaultPromise[T]].root
+      else this
+    }
 
     /** Try waiting for this promise to be completed.
      */
@@ -341,26 +327,29 @@ private[concurrent] final object Promise {
     override def value: Option[Try[T]] = Option(value0)
 
     @tailrec
-    private final def value0: Try[T] = get() match {
-      case c: Try[T @unchecked]             => c
-      case dp: DefaultPromise[T @unchecked] => compressedRoot(dp).value0
-      case cbs: Callbacks[T @unchecked]     => null
+    private final def value0: Try[T] = {
+      val state = get()
+      if (state.isInstanceOf[Try[T]]) state.asInstanceOf[Try[T]]
+      else if (state.isInstanceOf[DefaultPromise[T]]) compressedRoot(state.asInstanceOf[DefaultPromise[T]]).value0
+      else /*if (state.isInstanceOf[Callbacks[T]])*/ null
     }
 
     override final def tryComplete(value: Try[T]): Boolean =
       tryComplete0(resolveTry(value))
 
     @tailrec
-    private final def tryComplete0(v: Try[T]): Boolean =
-      get() match {
-        case cbs: Callbacks[T @unchecked]      =>
-          if (compareAndSet(cbs, v)) {
-            cbs.submitWithValue(v)
-            true
-          } else tryComplete0(v)
-        case _: Try[T @unchecked]             => false
-        case dp: DefaultPromise[T @unchecked] => compressedRoot(dp).tryComplete0(v)
+    private final def tryComplete0(v: Try[T]): Boolean = {
+      val state = get()
+      if (state.isInstanceOf[Callbacks[T]]) {
+        if (compareAndSet(state, v)) {
+          state.asInstanceOf[Callbacks[T]].submitWithValue(v)
+          true
+        } else tryComplete0(v)
       }
+      else if (state.isInstanceOf[DefaultPromise[T]])
+        compressedRoot(state.asInstanceOf[DefaultPromise[T]]).tryComplete0(v)
+      else /*if (state.isInstanceOf[Try[T]])*/ false
+    }
 
     override final def onComplete[U](func: Try[T] => U)(implicit executor: ExecutionContext): Unit =
       dispatchOrAddCallbacks(new Callback[T](executor.prepare(), func))
@@ -370,13 +359,16 @@ private[concurrent] final object Promise {
      *  to the root promise when linking two promises together.
      */
     @tailrec
-    private def dispatchOrAddCallbacks(callbacks: Callbacks[T]): Unit =
-      get() match {
-        case r: Try[T @unchecked]             => callbacks.submitWithValue(r)
-        case dp: DefaultPromise[T @unchecked] => compressedRoot(dp).dispatchOrAddCallbacks(callbacks)
-        case cbs: Callbacks[T @unchecked]     => if (compareAndSet(cbs, cbs prepend callbacks)) ()
-                                                 else dispatchOrAddCallbacks(callbacks)
+    private def dispatchOrAddCallbacks(callbacks: Callbacks[T]): Unit = {
+      val state = get()
+      if (state.isInstanceOf[Try[T]]) callbacks.submitWithValue(state.asInstanceOf[Try[T]])
+      else if (state.isInstanceOf[DefaultPromise[T]]) 
+        compressedRoot(state.asInstanceOf[DefaultPromise[T]]).dispatchOrAddCallbacks(callbacks)
+      else /*if (state.isInstanceOf[Callbacks[T]])*/ {
+        if(compareAndSet(state, state.asInstanceOf[Callbacks[T]] prepend callbacks)) ()
+        else dispatchOrAddCallbacks(callbacks)
       }
+    }
 
     /** Link this promise to the root of another promise using `link()`. Should only be
      *  be called by transformWith.
@@ -394,16 +386,15 @@ private[concurrent] final object Promise {
      */
     @tailrec
     private def link(target: DefaultPromise[T]): Unit = if (this ne target) {
-      get() match {
-        case r: Try[T @unchecked] =>
-          if (!target.tryComplete(r))
-            throw new IllegalStateException("Cannot link completed promises together")
-        case dp: DefaultPromise[T @unchecked] =>
-          compressedRoot(dp).link(target)
-        case cbs: Callbacks[T @unchecked] =>
-          if(compareAndSet(cbs, target)) target.dispatchOrAddCallbacks(cbs)
+      val state = get()
+      if (state.isInstanceOf[Try[T]]) {
+        if (!target.tryComplete(state.asInstanceOf[Try[T]]))
+          throw new IllegalStateException("Cannot link completed promises together")
+      } else if (state.isInstanceOf[DefaultPromise[T]]) compressedRoot(state.asInstanceOf[DefaultPromise[T]]).link(target)
+        else /*if (state.isInstanceOf[Callbacks[T]]) */ {
+          if (compareAndSet(state, target)) target.dispatchOrAddCallbacks(state.asInstanceOf[Callbacks[T]])
           else link(target)
-      }
+        }
     }
   }
 
@@ -443,13 +434,14 @@ private[concurrent] final object Promise {
 
     private[this] final var value: AnyRef = executor // value is initially the EC
 
-    override final def run(): Unit = value match {
-      case null => // already executed once already
-      case v: Try[T] =>
+    override final def run(): Unit = {
+      val v = value
+      if (v.isInstanceOf[Try[T]]) {
         value = null
-        try onComplete(v) catch { case NonFatal(e) => executor reportFailure e }
-      case e if e eq executor =>
+        try onComplete(v.asInstanceOf[Try[T]]) catch { case NonFatal(e) => executor reportFailure e }
+      } else if (v eq executor) {
         throw new IllegalStateException("Callback value must be set when running")
+      } else /*if (v eq null)*/ ()
     }
 
     override final def submitWithValue(v: Try[T]): Unit = 
@@ -462,24 +454,26 @@ private[concurrent] final object Promise {
         } // else … already submitted or already executed
       }
 
-    override final def prepend[U >: T](c: Callbacks[U]): Callbacks[U] = c match {
-      case a: Callback[U] =>
-        if (a eq NoopCallback) this
-        else if (this eq NoopCallback) a
-        else if (this eq a) this
-        else ManyCallbacks.two(this, a)
-      case m: ManyCallbacks[U] => m append this // m append this == this prepend m
+    override final def prepend[U >: T](c: Callbacks[U]): Callbacks[U] = {
+      if (c.isInstanceOf[Callback[T]]) {
+        if (c eq NoopCallback) this
+        else if (this eq NoopCallback) c
+        else if (this eq c) this
+        else ManyCallbacks.two(this, c)
+      } else /*if (c.isInstanceOf[ManyCallbacks[T]])*/ {
+        c.asInstanceOf[ManyCallbacks[T]] append this // m append this == this prepend m
+      }
     }
 
     override def toString: String = s"Callback($executor, $onComplete)"
   }
 
-  object ManyCallbacks {
-    def two[U](second: Callbacks[U], first: Callbacks[U]): ManyCallbacks[U] =
+  final object ManyCallbacks {
+    final def two[U](second: Callbacks[U], first: Callbacks[U]): ManyCallbacks[U] =
       new ManyCallbacks[U](NoopCallback, NoopCallback, second, first, 2)
-    def three[U](third: Callbacks[U], second: Callbacks[U], first: Callbacks[U]): ManyCallbacks[U] =
+    final def three[U](third: Callbacks[U], second: Callbacks[U], first: Callbacks[U]): ManyCallbacks[U] =
       new ManyCallbacks[U](NoopCallback, third, second, first, 1)
-    def four[U](fourth: Callbacks[U], third: Callbacks[U], second: Callbacks[U], first: Callbacks[U]): ManyCallbacks[U] =
+    final def four[U](fourth: Callbacks[U], third: Callbacks[U], second: Callbacks[U], first: Callbacks[U]): ManyCallbacks[U] =
       new ManyCallbacks[U](fourth, third, second, first, 0)
   }
 
@@ -490,7 +484,7 @@ private[concurrent] final object Promise {
     final val c4: Callbacks[T],
     private[ManyCallbacks] final val remainingCapacity: Int) extends Callbacks[T] {
 
-    //Don't want to incur the runtime ovehead of these checks, but this invariant will hold true:
+    //Don't want to incur the runtime overhead of these checks, but this invariant will hold true:
     //require(c3 ne NoopCallback)
     //require(c4 ne NoopCallback)
 
@@ -524,25 +518,25 @@ private[concurrent] final object Promise {
         }
       } else this
 
-    final def append[U >: T](c: Callbacks[U]): Callbacks[U] = c match {
-      case m: ManyCallbacks[U]    => this merge m
-      case a if a eq NoopCallback => this // Don't append Noops
-      case a: Callback[U]         =>
+    final def append[U >: T](c: Callbacks[U]): Callbacks[U] = {
+      if (c.isInstanceOf[ManyCallbacks[U]]) this merge c.asInstanceOf[ManyCallbacks[U]]
+      else if (c eq NoopCallback) this // Don't append Noops
+      else /*if (c.isInstanceOf[Callback[U]])*/
         (remainingCapacity: @switch) match {
-          case 0 => ManyCallbacks.two(this, a)
-          case 1 => ManyCallbacks.four(c2, c3, c4, a)
-          case 2 => ManyCallbacks.three(c3, c4, a)
+          case 0 => ManyCallbacks.two(this, c)
+          case 1 => ManyCallbacks.four(c2, c3, c4, c)
+          case 2 => ManyCallbacks.three(c3, c4, c)
         }
     }
 
-    override final def prepend[U >: T](c: Callbacks[U]): Callbacks[U] = c match {
-      case m: ManyCallbacks[U]    => m merge this
-      case a if a eq NoopCallback => this // Don't prepend Noops
-      case a: Callback[U]         =>
+    override final def prepend[U >: T](c: Callbacks[U]): Callbacks[U] = {
+      if (c.isInstanceOf[ManyCallbacks[U]]) c.asInstanceOf[ManyCallbacks[U]] merge this
+      else if (c eq NoopCallback) this // Don't prepend Noops
+      else /*if (c.isInstanceOf[Callback[U]])*/
         (remainingCapacity: @switch) match {
-          case 0 => ManyCallbacks.two(a, this)
-          case 1 => ManyCallbacks.four(a, c2, c3, c4)
-          case 2 => ManyCallbacks.three(a, c3, c4)
+          case 0 => ManyCallbacks.two(c, this)
+          case 1 => ManyCallbacks.four(c, c2, c3, c4)
+          case 2 => ManyCallbacks.three(c, c3, c4)
         }
     }
 
