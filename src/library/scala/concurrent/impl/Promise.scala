@@ -260,7 +260,7 @@ private[concurrent] final object Promise {
      *  be garbage collected. Also, subsequent calls to this method should be
      *  faster as the link chain will be shorter.
      */
-    private def compressedRoot(): DefaultPromise[T] = compressedRoot(null)
+    private final def compressedRoot(): DefaultPromise[T] = compressedRoot(null)
 
     @tailrec
     private[this] final def compressedRoot(linked: DefaultPromise[T]): DefaultPromise[T] = 
@@ -279,7 +279,7 @@ private[concurrent] final object Promise {
      *  to compress the link chain whenever possible.
      */
     @tailrec
-    private def root: DefaultPromise[T] = {
+    private final def root: DefaultPromise[T] = {
       val state = get()
       if (state.isInstanceOf[DefaultPromise[T]]) state.asInstanceOf[DefaultPromise[T]].root
       else this
