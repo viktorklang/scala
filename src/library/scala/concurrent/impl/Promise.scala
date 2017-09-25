@@ -260,22 +260,19 @@ private[concurrent] final object Promise {
      *  be garbage collected. Also, subsequent calls to this method should be
      *  faster as the link chain will be shorter.
      */
-    private def compressedRoot(): DefaultPromise[T] = {
-      val state = get()
-      if (state.isInstanceOf[DefaultPromise[T]]) compressedRoot(state.asInstanceOf[DefaultPromise[T]])
-      else this
-    }
+    private def compressedRoot(): DefaultPromise[T] = compressedRoot(null)
 
     @tailrec
-    private[this] final def compressedRoot(linked: DefaultPromise[T]): DefaultPromise[T] = {
-      val target = linked.root
-      if ((linked eq target) || compareAndSet(linked, target)) target
-      else {
+    private[this] final def compressedRoot(linked: DefaultPromise[T]): DefaultPromise[T] = 
+      if (linked ne null) {
+        val target = linked.root
+        if ((linked eq target) || compareAndSet(linked, target)) target
+        else compressedRoot(null)
+      } else {
         val state = get()
         if (state.isInstanceOf[DefaultPromise[T]]) compressedRoot(state.asInstanceOf[DefaultPromise[T]])
         else this
       }
-    }
 
     /** Get the promise at the root of the chain of linked promises. Used by `compressedRoot()`.
      *  The `compressedRoot()` method should be called instead of this method, as it is important
