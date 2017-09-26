@@ -121,19 +121,19 @@ object Promise {
    *  @tparam T       the type of the value in the promise
    *  @return         the newly created `Promise` object
    */
-  def failed[T](exception: Throwable): Promise[T] = fromTry(Failure(exception))
+  def failed[T](exception: Throwable): Promise[T] = new impl.Promise.DefaultPromise(Failure(exception))
 
   /** Creates an already completed Promise with the specified result.
    *
    *  @tparam T       the type of the value in the promise
    *  @return         the newly created `Promise` object
    */
-  def successful[T](result: T): Promise[T] = fromTry(Success(result))
+  def successful[T](result: T): Promise[T] = new impl.Promise.DefaultPromise(Success(result))
 
   /** Creates an already completed Promise with the specified result or exception.
    *
    *  @tparam T       the type of the value in the promise
    *  @return         the newly created `Promise` object
    */
-  def fromTry[T](result: Try[T]): Promise[T] = impl.Promise.KeptPromise[T](result)
+  def fromTry[T](result: Try[T]): Promise[T] = new impl.Promise.DefaultPromise[T](result)
 }
