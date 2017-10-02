@@ -345,8 +345,16 @@ private[concurrent] final object Promise {
       else /*if (state.isInstanceOf[Callbacks[T]])*/ null
     }
 
-    override final def tryComplete(value: Try[T]): Boolean =
-      tryComplete0(resolveTry(value))
+    override final def tryComplete(value: Try[T]): Boolean = {
+      val resolved = resolveTry(value)
+      val ret = tryComplete0(resolved)
+      if (ret) { // TODO: make this operation cheaper in the general case, by only invoking if linked prior
+        val state = get()
+        if (state.isInstanceOf[DefaultPromise[T]])
+          compareAndSet(state, resolved) // clears links, which is fine since we successfully completed the link
+      }
+      ret
+    }
 
     @tailrec
     private final def tryComplete0(v: Try[T]): Boolean = {
