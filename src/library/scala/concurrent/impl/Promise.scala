@@ -86,34 +86,6 @@ private[concurrent] final object Promise {
       override def apply(ignored: Try[T]): Unit = releaseShared(1)
     }
 
-    private final class Link[T](to: DefaultPromise[T]) extends AtomicReference[DefaultPromise[T]](to) {
-      final def promise(): DefaultPromise[T] = compressedRoot(this)
-
-      @tailrec private final def root(): DefaultPromise[T] = {
-        val cur = this.get()
-        val target = cur.get()
-        if (target.isInstanceOf[Link[T]]) target.asInstanceOf[Link[T]].root()
-        else cur
-      }
-
-      @tailrec private[this] final def compressedRoot(linked: Link[T]): DefaultPromise[T] = {
-        val current = linked.get()
-        val target = linked.root()
-        if ((current eq target) || compareAndSet(current, target)) target
-        else compressedRoot(this)
-      }
-
-      final def link(to: DefaultPromise[T]): DefaultPromise[T] = {
-        val target = to.get()
-        if (target.isInstanceOf[Link[T]]) link(target.asInstanceOf[Link[T]].promise())
-        else {
-          val current = get()
-          if (compareAndSet(current, to)) to
-          else link(to)
-        }
-      }
-    }
-
 
   /** Default promise implementation.
    *
@@ -284,8 +256,47 @@ private[concurrent] final object Promise {
     @tailrec private final def toString0: String = {
       val state = get()
       if (state.isInstanceOf[Try[T]]) s"Future($state)"
-      else if (state.isInstanceOf[Link[T]]) state.asInstanceOf[Link[T]].promise().toString0
+      else if (state.isInstanceOf[DefaultPromise[T]]) compressedRoot(state.asInstanceOf[DefaultPromise[T]]).toString0
       else /*if (state.isInstanceOf[Callbacks[T]]) */ "Future(<not completed>)"
+    }
+
+    /** Get the root promise for this promise, compressing the link chain to that
+     *  promise if necessary.
+     *
+     *  For promises that are not linked, the result of calling
+     *  `compressedRoot()` will the promise itself. However for linked promises,
+     *  this method will traverse each link until it locates the root promise at
+     *  the base of the link chain.
+     *
+     *  As a side effect of calling this method, the link from this promise back
+     *  to the root promise will be updated ("compressed") to point directly to
+     *  the root promise. This allows intermediate promises in the link chain to
+     *  be garbage collected. Also, subsequent calls to this method should be
+     *  faster as the link chain will be shorter.
+     */
+    private final def compressedRoot(): DefaultPromise[T] = compressedRoot(null)
+
+    @tailrec
+    private[this] final def compressedRoot(linked: DefaultPromise[T]): DefaultPromise[T] = 
+      if (linked ne null) {
+        val target = linked.root
+        if ((linked eq target) || compareAndSet(linked, target)) target
+        else compressedRoot(null)
+      } else {
+        val state = get()
+        if (state.isInstanceOf[DefaultPromise[T]]) compressedRoot(state.asInstanceOf[DefaultPromise[T]])
+        else this
+      }
+
+    /** Get the promise at the root of the chain of linked promises. Used by `compressedRoot()`.
+     *  The `compressedRoot()` method should be called instead of this method, as it is important
+     *  to compress the link chain whenever possible.
+     */
+    @tailrec
+    private final def root: DefaultPromise[T] = {
+      val state = get()
+      if (state.isInstanceOf[DefaultPromise[T]]) state.asInstanceOf[DefaultPromise[T]].root
+      else this
     }
 
     /** Try waiting for this promise to be completed.
@@ -330,20 +341,12 @@ private[concurrent] final object Promise {
     private final def value0: Try[T] = {
       val state = get()
       if (state.isInstanceOf[Try[T]]) state.asInstanceOf[Try[T]]
-      else if (state.isInstanceOf[Link[T]]) state.asInstanceOf[Link[T]].promise().value0
+      else if (state.isInstanceOf[DefaultPromise[T]]) compressedRoot(state.asInstanceOf[DefaultPromise[T]]).value0
       else /*if (state.isInstanceOf[Callbacks[T]])*/ null
     }
 
-    override final def tryComplete(value: Try[T]): Boolean = {
-      val r = resolveTry(value)
-      val completed = tryComplete0(r)
-      if (completed) { // TODO: figure out an ecoding which makes the clearing op cheaper
-        val state = get()
-        if (state.isInstanceOf[Link[T]])
-          compareAndSet(state, r) // The Link has served its purpose now and we can clear it out
-      }
-      completed
-    }
+    override final def tryComplete(value: Try[T]): Boolean =
+      tryComplete0(resolveTry(value))
 
     @tailrec
     private final def tryComplete0(v: Try[T]): Boolean = {
@@ -354,7 +357,8 @@ private[concurrent] final object Promise {
           true
         } else tryComplete0(v)
       }
-      else if (state.isInstanceOf[Link[T]]) state.asInstanceOf[Link[T]].promise().tryComplete0(v)
+      else if (state.isInstanceOf[DefaultPromise[T]])
+        compressedRoot(state.asInstanceOf[DefaultPromise[T]]).tryComplete0(v)
       else /*if (state.isInstanceOf[Try[T]])*/ false
     }
 
@@ -369,8 +373,8 @@ private[concurrent] final object Promise {
     private def dispatchOrAddCallbacks(callbacks: Callbacks[T]): Unit = {
       val state = get()
       if (state.isInstanceOf[Try[T]]) callbacks.submitWithValue(state.asInstanceOf[Try[T]])
-      else if (state.isInstanceOf[Link[T]])
-        state.asInstanceOf[Link[T]].promise().dispatchOrAddCallbacks(callbacks)
+      else if (state.isInstanceOf[DefaultPromise[T]]) 
+        compressedRoot(state.asInstanceOf[DefaultPromise[T]]).dispatchOrAddCallbacks(callbacks)
       else /*if (state.isInstanceOf[Callbacks[T]])*/ {
         if(compareAndSet(state, state.asInstanceOf[Callbacks[T]] prepend callbacks)) ()
         else dispatchOrAddCallbacks(callbacks)
@@ -380,7 +384,7 @@ private[concurrent] final object Promise {
     /** Link this promise to the root of another promise using `link()`. Should only be
      *  be called by transformWith.
      */
-    protected[concurrent] final def linkRootOf(target: DefaultPromise[T]): Unit = link(new Link(target))
+    protected[concurrent] final def linkRootOf(target: DefaultPromise[T]): Unit = link(target.compressedRoot())
 
     /** Link this promise to another promise so that both promises share the same
      *  externally-visible state. Depending on the current state of this promise, this
@@ -392,18 +396,15 @@ private[concurrent] final object Promise {
      *  promise's result to the target promise.
      */
     @tailrec
-    private[this] def link(target: Link[T]): Unit = {
-      val promise = target.promise()
-      if (this ne promise) {
-        val state = get()
-        if (state.isInstanceOf[Try[T]]) {
-          if (!promise.tryComplete(state.asInstanceOf[Try[T]]))
-            throw new IllegalStateException("Cannot link completed promises together")
-        } else if (state.isInstanceOf[Link[T]]) state.asInstanceOf[Link[T]].link(promise)
-        else /*if (state.isInstanceOf[Callbacks[T]]) */ {
-          if (compareAndSet(state, target)) target.promise().dispatchOrAddCallbacks(state.asInstanceOf[Callbacks[T]])
-          else link(target)
-        }
+    private def link(target: DefaultPromise[T]): Unit = if (this ne target) {
+      val state = get()
+      if (state.isInstanceOf[Try[T]]) {
+        if (!target.tryComplete(state.asInstanceOf[Try[T]]))
+          throw new IllegalStateException("Cannot link completed promises together")
+      } else if (state.isInstanceOf[DefaultPromise[T]]) compressedRoot(state.asInstanceOf[DefaultPromise[T]]).link(target)
+      else /*if (state.isInstanceOf[Callbacks[T]]) */ {
+        if (compareAndSet(state, target)) target.dispatchOrAddCallbacks(state.asInstanceOf[Callbacks[T]])
+        else link(target)
       }
     }
   }
