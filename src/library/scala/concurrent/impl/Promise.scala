@@ -21,27 +21,21 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.Objects.requireNonNull
 
 private[concurrent] final object Promise {
-   private final def resolveFailure[T](f: Failure[T]): Try[T] = {
-    requireNonNull(f)
-    val t = f.exception
-    if (t.isInstanceOf[NonLocalReturnControl[T @unchecked]])
-      Success(t.asInstanceOf[NonLocalReturnControl[T]].value)
-    else if (t.isInstanceOf[ControlThrowable]
-            || t.isInstanceOf[InterruptedException]
-            || t.isInstanceOf[Error])
-      Failure(new ExecutionException("Boxed Exception", t)) 
-    else
-      f
-  }
-
-  private final def resolveSuccess[T](s: Success[T]): Try[T] = 
-    requireNonNull(s)
 
   private final def resolveTry[T](source: Try[T]): Try[T] = 
-    if (source.isInstanceOf[Success[T]])
-      resolveSuccess(source.asInstanceOf[Success[T]])
-    else
-      resolveFailure(source.asInstanceOf[Failure[T]])
+    if (source.isInstanceOf[Failure[T]]) {
+      val f = source.asInstanceOf[Failure[T]]
+      val t = f.exception
+      val r = if (t.isInstanceOf[NonLocalReturnControl[T @unchecked]])
+        Success(t.asInstanceOf[NonLocalReturnControl[T]].value)
+      else if (t.isInstanceOf[ControlThrowable]
+              || t.isInstanceOf[InterruptedException]
+              || t.isInstanceOf[Error])
+        Failure(new ExecutionException("Boxed Exception", t))
+      else
+        f
+      r
+    } else requireNonNull(source)
 
    /**
     * Latch used to implement waiting on a DefaultPromise's result.
@@ -179,16 +173,6 @@ private[concurrent] final object Promise {
     def this(result: Try[T]) = this(resolveTry(result): AnyRef)
 
     /**
-     * Constructs a new, completed, Promise.
-     */
-    def this(success: Success[T]) = this(resolveSuccess(success): AnyRef)
-
-    /**
-     * Constructs a new, completed, Promise.
-     */
-    def this(failure: Failure[T]) = this(resolveFailure(failure): AnyRef)
-
-    /**
      * Returns the associaed `Future` with this `Promise`
      */
     override def future: Future[T] = this
@@ -307,29 +291,24 @@ private[concurrent] final object Promise {
       else /*if (state.isInstanceOf[Callbacks[T]])*/ null
     }
 
-    override final def tryComplete(value: Try[T]): Boolean = {
-      val r = resolveTry(value)
-      val completed = tryComplete0(r)
-      if (completed) { // TODO: figure out an encoding which makes the clearing op cheaper
-        val state = get()
-        if (state.isInstanceOf[Link[T]])
-          compareAndSet(state, r) // The Link has served its purpose now and we can clear it out
-      }
-      completed
-    }
+    override final def tryComplete(value: Try[T]): Boolean =
+      tryComplete0(resolveTry(value))
 
     @tailrec
     private final def tryComplete0(v: Try[T]): Boolean = {
       val state = get()
       if (state.isInstanceOf[Callbacks[T]]) {
-        if (compareAndSet(state, v)) {
+        val replaced = compareAndSet(state, v)
+
+        if (replaced)
           state.asInstanceOf[Callbacks[T]].submitWithValue(v)
-          true
-        } else tryComplete0(v)
+
+        replaced || tryComplete0(v)
       }
       else if (state.isInstanceOf[Link[T]]) state.asInstanceOf[Link[T]].promise().tryComplete0(v)
       else /*if (state.isInstanceOf[Try[T]])*/ false
     }
+
     override final def onComplete[U](func: Try[T] => U)(implicit executor: ExecutionContext): Unit =
       dispatchOrAddCallbacks(new TransformationalPromise[T,({type Id[a] = a})#Id,U](func, executor.prepare()))
 
