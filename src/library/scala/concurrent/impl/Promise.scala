@@ -43,32 +43,6 @@ private[concurrent] final object Promise {
     else
       resolveFailure(source.asInstanceOf[Failure[T]])
 
-  final def transformWithDefaultPromise[T, S](f: Try[T] => Future[S]): DefaultPromise[S] with (Try[T] => Unit) =
-   new DefaultPromise[S] with (Try[T] => Unit) {
-      private[this] final var fun = f
-      override final def apply(v: Try[T]): Unit = if (fun ne null) {
-        try fun(v) match {
-          case dp: DefaultPromise[S @unchecked] => dp.linkRootOf(this) // If possible, link DefaultPromises to avoid space leaks
-          case fut => this completeWith fut
-        } catch { case NonFatal(t) => this failure t } finally { fun = null }
-      }
-      override final def toString: String = super[DefaultPromise].toString
-    }
-
-  final def transformImpl[T, S](future: Future[T], f: Try[T] => Try[S])(implicit ec: ExecutionContext): Future[S] = {
-    val p = transformDefaultPromise(f)
-    future.onComplete(p)
-    p.future
-  }
-
-  final def transformDefaultPromise[T, S](f: Try[T] => Try[S]): DefaultPromise[S] with (Try[T] => Unit) =
-    new DefaultPromise[S] with (Try[T] => Unit) {
-      private[this] var fun = f
-      override final def apply(result: Try[T]): Unit = 
-        if (fun ne null) this.complete(try fun(result) catch { case NonFatal(t) => Failure(t) } finally { fun = null })
-      override final def toString: String = super[DefaultPromise].toString
-    }
-
    /**
     * Latch used to implement waiting on a DefaultPromise's result.
     *
@@ -221,14 +195,14 @@ private[concurrent] final object Promise {
     override def future: Future[T] = this
 
     override def transform[S](f: Try[T] => Try[S])(implicit executor: ExecutionContext): Future[S] = {
-      val p = Promise.transformDefaultPromise(f)
-      onComplete(p)
+      val p = new TransformationalPromise(f, executor)
+      dispatchOrAddCallbacks(p)
       p.future
     }
 
     override def transformWith[S](f: Try[T] => Future[S])(implicit executor: ExecutionContext): Future[S] = {
-      val p = transformWithDefaultPromise(f)
-      onComplete(p)
+      val p = new TransformationalPromise(f, executor)
+      dispatchOrAddCallbacks(p)
       p.future
     }
 
@@ -359,14 +333,13 @@ private[concurrent] final object Promise {
     }
 
     override final def onComplete[U](func: Try[T] => U)(implicit executor: ExecutionContext): Unit =
-      dispatchOrAddCallbacks(new Callback[T](executor.prepare(), func))
+      dispatchOrAddCallbacks(new TransformationalPromise[T,({type Id[a] = a})#Id,U](func, executor))
 
     /** Tries to add the callback, if already completed, it dispatches the callback to be executed.
      *  Used by `onComplete()` to add callbacks to a promise and by `link()` to transfer callbacks
      *  to the root promise when linking two promises together.
      */
-    @tailrec
-    private def dispatchOrAddCallbacks(callbacks: Callbacks[T]): Unit = {
+    @tailrec private final def dispatchOrAddCallbacks(callbacks: Callbacks[T]): Unit = {
       val state = get()
       if (state.isInstanceOf[Try[T]]) callbacks.submitWithValue(state.asInstanceOf[Try[T]])
       else if (state.isInstanceOf[Link[T]])
@@ -392,7 +365,7 @@ private[concurrent] final object Promise {
      *  promise's result to the target promise.
      */
     @tailrec
-    private[this] def link(target: Link[T]): Unit = {
+    private[this] final def link(target: Link[T]): Unit = {
       val promise = target.promise()
       if (this ne promise) {
         val state = get()
@@ -408,10 +381,48 @@ private[concurrent] final object Promise {
     }
   }
 
+  final class TransformationalPromise[F, M[_], T](f: Try[F] => M[T], ec: ExecutionContext) extends DefaultPromise[T]() with Callbacks[F] with Runnable with OnCompleteRunnable {
+    private[this] final var _ec: ExecutionContext = ec.prepare()
+    private[this] final var _in: Try[F] = _
+    private[this] final var _fun: Try[F] => M[T] = f
+
+    override final def prepend[U >: F](c: Callbacks[U]): Callbacks[U] =
+      if (c.isInstanceOf[ManyCallbacks[U]]) c.asInstanceOf[ManyCallbacks[U]].append(this: Callbacks[F])
+      else if (c eq NoopCallback) this
+      else ManyCallbacks.two(c, this)
+
+    override def submitWithValue(v: Try[F @uncheckedVariance]): Unit = {
+      val executor = _ec
+      _in = v
+      try executor.execute(this) catch { case NonFatal(t) => executor reportFailure t } finally { _ec = null }
+    }
+
+    private[this] final def execute(v: Try[F], fn: Try[F] => M[T]): Unit =
+      fn(v) match {
+        case t: Try[T] => this complete t
+        case dp: DefaultPromise[T @unchecked] => dp.linkRootOf(this) // If possible, link DefaultPromises to avoid space leaks
+        case fut: Future[T @unchecked] => this completeWith fut
+        case other: T @unchecked => this success other
+      } 
+
+    override final def run(): Unit = {
+      val v = _in
+      val fun = _fun
+      try execute(v, fun) catch {
+        case NonFatal(t) => this failure t
+      } finally {
+        _fun = null
+        _in = null
+      }
+    }
+
+    override final def toString: String = super[DefaultPromise].toString
+  }
+
   /* Encodes the concept of having callbacks.
    * This is an `abstract class` to make sure calls are `invokevirtual` rather than `invokeinterface`
    */
-  sealed abstract class Callbacks[+T] {
+  sealed trait Callbacks[+T] {
     /* Logically prepends the callback `c` onto `this` callback */
     def prepend[U >: T](c: Callbacks[U]): Callbacks[U]
     /* Submits the callback function(s) represented by this Callback to be executed with the given value `v` */
@@ -421,52 +432,9 @@ private[concurrent] final object Promise {
   /* Represents 0 Callbacks, is used as an initial, sentinel, value for DefaultPromise
    * This used to be a `case object` but in order to keep `Callbacks`'s methods bimorphic it was reencoded as `val`
    */
-  final val NoopCallback: Callbacks[Nothing] =
-    new Callback[Nothing](new ExecutionContext {
-      override def execute(r: Runnable): Unit = throw new IllegalStateException("Noop ExecutionContext.execute!")
-      override def reportFailure(t: Throwable): Unit = t.printStackTrace(System.err)
-      override def toString: String = "<Noop>"
-    }, _ => ())
-
-  /* Represents a single Callback function.
-     Precondition: `executor` is prepar()-ed */
-  final class Callback[T](
-    final val executor: ExecutionContext,
-    final val onComplete: Try[T] => Any) extends Callbacks[T] with Runnable with OnCompleteRunnable {
-
-    private[this] final var value: AnyRef = executor // value is initially the EC
-
-    override final def run(): Unit = {
-      val v = value
-      if (v.isInstanceOf[Try[T]]) {
-        value = null
-        try onComplete(v.asInstanceOf[Try[T]]) catch { case NonFatal(e) => executor reportFailure e }
-      } else if (v eq executor) {
-        throw new IllegalStateException("Callback value must be set when running")
-      } else /*if (v eq null)*/ ()
-    }
-
-    override final def submitWithValue(v: Try[T]): Unit = 
-      if (this ne NoopCallback) {
-        val e = value
-        if (e eq executor) {
-          value = v // Safe publication of `value`, to run(), is achieved via `executor.execute(this)`
-          // Note that we cannot prepare the ExecutionContext at this point, since we might already be running on a different thread!            
-          try executor.execute(this) catch { case NonFatal(t) => executor reportFailure t }
-        } // else … already submitted or already executed
-      }
-
-    override final def prepend[U >: T](c: Callbacks[U]): Callbacks[U] = {
-      if (c.isInstanceOf[Callback[T]]) {
-        if ((c eq NoopCallback) || (this eq c)) this
-        else if (this eq NoopCallback) c
-        else ManyCallbacks.two(this, c)
-      } else /*if (c.isInstanceOf[ManyCallbacks[T]])*/ {
-        c.asInstanceOf[ManyCallbacks[T]] append this // m append this == this prepend m
-      }
-    }
-
-    override def toString: String = s"Callback($executor, $onComplete)"
+  final object NoopCallback extends Callbacks[Nothing] {
+    override def prepend[U >: Nothing](c: Callbacks[U]): Callbacks[U] = c 
+    override def submitWithValue(v: Try[Nothing @uncheckedVariance]): Unit = ()
   }
 
   final object ManyCallbacks {
@@ -550,5 +518,4 @@ private[concurrent] final object Promise {
 
     override final def toString: String = s"Callbacks($c1, $c2, $c3, $c4)"
   }
-
 }
