@@ -25,7 +25,7 @@ private[concurrent] final object Promise {
   private final def resolveTry[T](source: Try[T]): Try[T] = 
     if (source.isInstanceOf[Failure[T]]) {
       val f = source.asInstanceOf[Failure[T]]
-      val t = f.exception
+      val t = f.exception // NPE from deref here desired to validate non-nullness
       val r = if (t.isInstanceOf[NonLocalReturnControl[T @unchecked]])
         Success(t.asInstanceOf[NonLocalReturnControl[T]].value)
       else if (t.isInstanceOf[ControlThrowable]
@@ -351,7 +351,7 @@ private[concurrent] final object Promise {
             throw new IllegalStateException("Cannot link completed promises together")
         } else if (state.isInstanceOf[Link[T]]) state.asInstanceOf[Link[T]].link(promise)
         else /*if (state.isInstanceOf[Callbacks[T]]) */ {
-          if (compareAndSet(state, target)) target.promise().dispatchOrAddCallbacks(state.asInstanceOf[Callbacks[T]])
+          if (compareAndSet(state, target)) promise.dispatchOrAddCallbacks(state.asInstanceOf[Callbacks[T]])
           else link(target)
         }
       }
