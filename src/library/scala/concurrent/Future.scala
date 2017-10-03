@@ -138,7 +138,7 @@ trait Future[+T] extends Awaitable[T] {
    */
   @deprecated("use `onComplete` or `failed.foreach` instead (keep in mind that they take total rather than partial functions)", "2.12.0")
   def onFailure[U](@deprecatedName('callback) pf: PartialFunction[Throwable, U])(implicit executor: ExecutionContext): Unit = onComplete {
-      t => if(t.isFailure) pf.applyOrElse[Throwable, Any](t.asInstanceOf[Failure[_]].exception, Future.id[Throwable])
+      t => if(t.isInstanceOf[Failure[T]]) pf.applyOrElse[Throwable, Any](t.asInstanceOf[Failure[T]].exception, Future.id[Throwable])
   }
 
   /** When this future is completed, either through an exception, or a value,

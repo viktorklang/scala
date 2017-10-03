@@ -165,8 +165,7 @@ private[concurrent] final object Promise {
    * DefaultPromises, and `linkedRootOf` is currently only designed to be called
    * by Future.flatMap.
    */
-  // Left non-final to enable addition of extra fields by Java/Scala converters
-  // in scala-java8-compat.
+  // Left non-final to enable addition of extra fields by Java/Scala converters in scala-java8-compat.
   class DefaultPromise[T] private[this] (init: AnyRef) extends AtomicReference[AnyRef](init) with scala.concurrent.Promise[T] with scala.concurrent.Future[T] {
 
     /**
