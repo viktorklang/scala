@@ -21,22 +21,6 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.Objects.requireNonNull
 
 private[concurrent] final object Promise {
-
-  private final def resolveTry[T](source: Try[T]): Try[T] = 
-    if (source.isInstanceOf[Failure[T]]) {
-      val f = source.asInstanceOf[Failure[T]]
-      val t = f.exception // NPE from deref here desired to validate non-nullness
-      val r = if (t.isInstanceOf[NonLocalReturnControl[T @unchecked]])
-        Success(t.asInstanceOf[NonLocalReturnControl[T]].value)
-      else if (t.isInstanceOf[ControlThrowable]
-              || t.isInstanceOf[InterruptedException]
-              || t.isInstanceOf[Error])
-        Failure(new ExecutionException("Boxed Exception", t))
-      else
-        f
-      r
-    } else requireNonNull(source)
-
    /**
     * Latch used to implement waiting on a DefaultPromise's result.
     *
@@ -160,17 +144,26 @@ private[concurrent] final object Promise {
    * by Future.flatMap.
    */
   // Left non-final to enable addition of extra fields by Java/Scala converters in scala-java8-compat.
-  class DefaultPromise[T] private[this] (init: AnyRef) extends AtomicReference[AnyRef](init) with scala.concurrent.Promise[T] with scala.concurrent.Future[T] {
-
-    /**
-     * Constructs a new, uncompleted, Promise.
-     */
-    def this() = this(NoopCallback: AnyRef)
-
+  class DefaultPromise[T] extends AtomicReference[AnyRef](NoopCallback: AnyRef) with scala.concurrent.Promise[T] with scala.concurrent.Future[T] {
     /**
      * Constructs a new, completed, Promise.
      */
-    def this(result: Try[T]) = this(resolveTry(result): AnyRef)
+    def this(result: Try[T]) = {
+      this()
+      set(resolve(result))
+    }
+
+    private[this] final def resolve(value: Try[T]): Try[T] =
+      if (requireNonNull(value).isInstanceOf[Success[T]]) return value
+      else {
+        val t = value.asInstanceOf[Failure[T]].exception
+        if (t.isInstanceOf[ControlThrowable] || t.isInstanceOf[InterruptedException] || t.isInstanceOf[Error]) {
+          if (t.isInstanceOf[NonLocalReturnControl[T @unchecked]])
+            return Success(t.asInstanceOf[NonLocalReturnControl[T]].value)
+          else
+            return Failure(new ExecutionException("Boxed Exception", t))
+        } else return value
+      }
 
     /**
      * Returns the associaed `Future` with this `Promise`
@@ -188,6 +181,8 @@ private[concurrent] final object Promise {
       dispatchOrAddCallbacks(p)
       p.future
     }
+
+    @inline private[this] final def coerce[F[_],A,B](f: F[A]): F[B] = f.asInstanceOf[F[B]]
 
     private[this] final def failureOrUnknown: Boolean = {
       val v = value0
@@ -210,31 +205,31 @@ private[concurrent] final object Promise {
 
     override def flatMap[S](f: T => Future[S])(implicit executor: ExecutionContext): Future[S] = 
       if (successOrUnknown) super[Future].flatMap(f)
-      else Future.coerce(this)
+      else coerce(this)
 
     override def map[S](f: T => S)(implicit executor: ExecutionContext): Future[S] =
       if (successOrUnknown) super[Future].map(f)
-      else Future.coerce(this)
+      else coerce(this)
 
     override def filter(@deprecatedName('pred) p: T => Boolean)(implicit executor: ExecutionContext): Future[T] =
       if (successOrUnknown) super[Future].filter(p)
-      else Future.coerce(this)
+      else coerce(this)
 
     override def collect[S](pf: PartialFunction[T, S])(implicit executor: ExecutionContext): Future[S] =
       if (successOrUnknown) super[Future].collect(pf)
-      else Future.coerce(this)
+      else coerce(this)
 
     override def recoverWith[U >: T](pf: PartialFunction[Throwable, Future[U]])(implicit executor: ExecutionContext): Future[U] =
       if (failureOrUnknown) super[Future].recoverWith(pf)
-      else Future.coerce(this)
+      else coerce(this)
 
     override def recover[U >: T](pf: PartialFunction[Throwable, U])(implicit executor: ExecutionContext): Future[U] =
       if (failureOrUnknown) super[Future].recover(pf)
-      else Future.coerce(this)
+      else coerce(this)
 
     override def mapTo[S](implicit tag: scala.reflect.ClassTag[S]): Future[S] =
       if (successOrUnknown) super[Future].mapTo[S](tag)
-      else Future.coerce(this)
+      else coerce(this)
 
     override def toString: String = toString0
 
@@ -292,7 +287,7 @@ private[concurrent] final object Promise {
     }
 
     override final def tryComplete(value: Try[T]): Boolean =
-      tryComplete0(resolveTry(value))
+      tryComplete0(resolve(value))
 
     @tailrec
     private final def tryComplete0(v: Try[T]): Boolean = {
@@ -300,7 +295,7 @@ private[concurrent] final object Promise {
       if (state.isInstanceOf[Callbacks[T]]) {
         val replaced = compareAndSet(state, v)
 
-        if (replaced)
+        if (replaced && (state ne NoopCallback))
           state.asInstanceOf[Callbacks[T]].submitWithValue(v)
 
         replaced || tryComplete0(v)
