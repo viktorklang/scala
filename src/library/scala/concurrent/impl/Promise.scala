@@ -352,8 +352,10 @@ private[concurrent] final object Promise {
             throw new IllegalStateException("Cannot link completed promises together")
         } else if (state.isInstanceOf[Link[T]]) state.asInstanceOf[Link[T]].link(promise)
         else /*if (state.isInstanceOf[Callbacks[T]]) */ {
-          if (compareAndSet(state, target)) promise.dispatchOrAddCallbacks(state.asInstanceOf[Callbacks[T]])
-          else link(target)
+          if (compareAndSet(state, target)) {
+            if (state ne NoopCallback)
+              promise.dispatchOrAddCallbacks(state.asInstanceOf[Callbacks[T]])
+          } else link(target)
         }
       }
     }
