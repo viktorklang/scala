@@ -287,19 +287,21 @@ private[concurrent] final object Promise {
       }
 
     override final def tryComplete(value: Try[T]): Boolean =
-      tryComplete0(resolve(value))
+      tryComplete0(value, false)
 
     @tailrec
-    private final def tryComplete0(v: Try[T]): Boolean = {
+    private final def tryComplete0(v: Try[T], resolved: Boolean): Boolean = {
       val state = get()
-      if (state.isInstanceOf[Callbacks[T]]) {
-        if (compareAndSet(state, v)) {
-          submitWithValue(state.asInstanceOf[Callbacks[T]], v)
+      if (state.isInstanceOf[Try[T]]) false
+      else if (state.isInstanceOf[Callbacks[T]]) {
+        val rv = if (resolved) v else resolve(v)
+        if (compareAndSet(state, rv)) {
+          submitWithValue(state.asInstanceOf[Callbacks[T]], rv)
           true
-        } else tryComplete0(v)
+        } else tryComplete0(rv, true)
       }
-      else if (state.isInstanceOf[Link[T]]) state.asInstanceOf[Link[T]].promise().tryComplete0(v)
-      else /*if (state.isInstanceOf[Try[T]])*/ false
+      else /*if (state.isInstanceOf[Link[T]])*/
+        state.asInstanceOf[Link[T]].promise().tryComplete0(v, resolved)
     }
 
     override final def onComplete[U](func: Try[T] => U)(implicit executor: ExecutionContext): Unit =
@@ -320,9 +322,10 @@ private[concurrent] final object Promise {
     }
 
     private[this] final def submitWithValue(c: Callbacks[T], v: Try[T]): Unit = {
-       if (c.isInstanceOf[TransformationalPromise[T,({type Id[a] = a})#Id,_]])
-         c.asInstanceOf[TransformationalPromise[T,({type Id[a] = a})#Id,_]].submitWithValue(v)
-       else if (c.isInstanceOf[ManyCallbacks[T]]) c.asInstanceOf[ManyCallbacks[T]].submitWithValue(v)
+       if (c.isInstanceOf[AbstractTransformationalPromise[T,_]])
+         c.asInstanceOf[AbstractTransformationalPromise[T,_]].submitWithValue(v)
+       else if (c.isInstanceOf[ManyCallbacks[T]])
+         c.asInstanceOf[ManyCallbacks[T]].submitWithValue(v)
     }
 
     /** Link this promise to the root of another promise using `link()`. Should only be
