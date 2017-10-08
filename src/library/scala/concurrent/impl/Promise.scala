@@ -153,17 +153,11 @@ private[concurrent] final object Promise {
      */
     override def future: Future[T] = this
 
-    override def transform[S](f: Try[T] => Try[S])(implicit executor: ExecutionContext): Future[S] = {
-      val p = new TransformationalPromise(f, executor.prepare())
-      dispatchOrAddCallbacks(p)
-      p.future
-    }
+    override def transform[S](f: Try[T] => Try[S])(implicit executor: ExecutionContext): Future[S] =
+      dispatchOrAddCallbacks(new TransformationalPromise(f, executor.prepare())).future
 
-    override def transformWith[S](f: Try[T] => Future[S])(implicit executor: ExecutionContext): Future[S] = {
-      val p = new TransformationalPromise(f, executor.prepare())
-      dispatchOrAddCallbacks(p)
-      p.future
-    }
+    override def transformWith[S](f: Try[T] => Future[S])(implicit executor: ExecutionContext): Future[S] =
+      dispatchOrAddCallbacks(new TransformationalPromise(f, executor.prepare())).future
 
     @inline private[this] final def coerce[F[_],A,B](f: F[A]): F[B] = f.asInstanceOf[F[B]]
 
@@ -306,16 +300,15 @@ private[concurrent] final object Promise {
      *  Used by `onComplete()` to add callbacks to a promise and by `link()` to transfer callbacks
      *  to the root promise when linking two promises together.
      */
-    @tailrec private final def dispatchOrAddCallbacks(callbacks: Callbacks[T]): Unit =
-      if (callbacks ne NoopCallback) {
-        val state = get()
-        if (state.isInstanceOf[Try[T]]) callbacks.submitWithValue(state.asInstanceOf[Try[T]])
-        else if (state.isInstanceOf[Callbacks[T]]) {
-          if(compareAndSet(state, state.asInstanceOf[Callbacks[T]] prepend callbacks)) ()
-          else dispatchOrAddCallbacks(callbacks)
-        } else /*if (state.isInstanceOf[Link[T]])*/
-          state.asInstanceOf[Link[T]].promise().dispatchOrAddCallbacks(callbacks)
-      }
+    @tailrec private final def dispatchOrAddCallbacks[C <: Callbacks[T]](callbacks: C): C = {
+      val state = get()
+      if (state.isInstanceOf[Try[T]]) callbacks.submitWithValue(state.asInstanceOf[Try[T]])
+      else if (state.isInstanceOf[Callbacks[T]]) {
+        if(compareAndSet(state, state.asInstanceOf[Callbacks[T]] prepend callbacks)) callbacks
+        else dispatchOrAddCallbacks(callbacks)
+      } else /*if (state.isInstanceOf[Link[T]])*/
+        state.asInstanceOf[Link[T]].promise().dispatchOrAddCallbacks(callbacks)
+    }
 
     /** Link this promise to the root of another promise using `link()`. Should only be
      *  be called by transformWith.
@@ -352,9 +345,12 @@ private[concurrent] final object Promise {
 
   sealed abstract class AbstractTransformationalPromise[+F, T] extends DefaultPromise[T]() with Callbacks[F] with Runnable with OnCompleteRunnable {
     override final def prepend[U >: F](c: Callbacks[U]): Callbacks[U] =
-      if (c.isInstanceOf[ManyCallbacks[U]]) c.asInstanceOf[ManyCallbacks[U]].append(this) // TODO: revisi ordering requirements
-      else if (c eq Promise.NoopCallback) this
-      else new ManyCallbacks(c.asInstanceOf[AbstractTransformationalPromise[U,_]], this)
+      if (c.isInstanceOf[AbstractTransformationalPromise[U,_]])
+        new ManyCallbacks(c.asInstanceOf[AbstractTransformationalPromise[U,_]], this)
+      else
+      if (c.isInstanceOf[ManyCallbacks[U]])
+        c.asInstanceOf[ManyCallbacks[U]].append(this) // TODO: fix this expensive operation. Op only happens when relocating callbacks at linking
+      else /*if (c eq Promise.NoopCallback)*/ this
 
     override final def toString: String = super[DefaultPromise].toString
   }
@@ -365,13 +361,14 @@ private[concurrent] final object Promise {
 
     // Gets invoked when a value is available, schedules it to be run():ed by the ExecutionContext
     // submitWithValue *happens-before* run(), through ExecutionContext.execute.
-    override final def submitWithValue(v: Try[F @uncheckedVariance]): Unit = {
+    override final def submitWithValue(v: Try[F @uncheckedVariance]): this.type = {
       val a = _arg
       if (a.isInstanceOf[ExecutionContext]) {
         val executor = a.asInstanceOf[ExecutionContext]
         _arg = requireNonNull(v)
         try executor.execute(this) catch { case NonFatal(t) => executor reportFailure t }
       }
+      this
     }
 
     // Gets invoked by run(), runs the transformation and stores the result
@@ -380,7 +377,7 @@ private[concurrent] final object Promise {
       if (res.isInstanceOf[Try[T @unchecked]]) this complete res.asInstanceOf[Try[T]]
       else if (res.isInstanceOf[DefaultPromise[T @unchecked]]) res.asInstanceOf[DefaultPromise[T]].linkRootOf(this)
       else if (res.isInstanceOf[Future[T @unchecked]]) this completeWith res.asInstanceOf[Future[T]]
-      else this success res.asInstanceOf[T]
+      else this success res.asInstanceOf[T] // TODO: is this line required?
     }
 
     // Gets invoked by the ExecutionContext, when we have a value to transform
@@ -402,7 +399,7 @@ private[concurrent] final object Promise {
    */
   sealed trait Callbacks[+T] {
     def prepend[U >: T](c: Callbacks[U]): Callbacks[U]
-    def submitWithValue(v: Try[T @uncheckedVariance]): Unit
+    def submitWithValue(v: Try[T @uncheckedVariance]): this.type
   }
 
   /* Represents 0 Callbacks, is used as an initial, sentinel, value for DefaultPromise
@@ -410,7 +407,7 @@ private[concurrent] final object Promise {
    */
   final object NoopCallback extends Callbacks[Nothing] {
     override final def prepend[U >: Nothing](c: Callbacks[U]): Callbacks[U] = c
-    override final def submitWithValue(v: Try[Nothing]): Unit = ()
+    override final def submitWithValue(v: Try[Nothing]): this.type = this
     override final def toString: String = "Noop"
   }
 
@@ -431,7 +428,7 @@ private[concurrent] final object Promise {
       new ManyCallbacks(tp, this, size + 1)
 
     final def append[U >: T](tp: AbstractTransformationalPromise[U,_]): ManyCallbacks[U] =
-      this concat new ManyCallbacks(tp, NoopCallback, 1)
+      this concat new ManyCallbacks(tp, NoopCallback, 1) // TODO: Avoid this allocation
 
     final def concat[U >: T](m: ManyCallbacks[U]): ManyCallbacks[U] = {
       @tailrec def toBuf(buf: Array[AbstractTransformationalPromise[T,_]], pos: Int, cur: ManyCallbacks[T]): Array[AbstractTransformationalPromise[T,_]] =
@@ -452,7 +449,10 @@ private[concurrent] final object Promise {
         else fromBuf(toBuf(new Array[AbstractTransformationalPromise[T,_]](size), 0, this), size - 1, m)
     }
 
-    override final def submitWithValue(v: Try[T @uncheckedVariance]): Unit = submitWithValue(this, v)
+    override final def submitWithValue(v: Try[T @uncheckedVariance]): this.type = {
+      submitWithValue(this, v)
+      this
+    }
 
     @tailrec private[this] final def submitWithValue(cb: Callbacks[T], v: Try[T]): Unit =
       if (cb.isInstanceOf[ManyCallbacks[T]]) {
