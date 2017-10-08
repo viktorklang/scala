@@ -345,11 +345,8 @@ private[concurrent] final object Promise {
 
   sealed abstract class XformCallback[+F, T] extends DefaultPromise[T]() with Callbacks[F] with Runnable with OnCompleteRunnable {
     override final def prepend[U >: F](c: Callbacks[U]): Callbacks[U] =
-      if (c.isInstanceOf[XformCallback[U,_]])
-        new ManyCallbacks(c.asInstanceOf[XformCallback[U,_]], this)
-      else
-      if (c.isInstanceOf[ManyCallbacks[U]])
-        c.asInstanceOf[ManyCallbacks[U]].append(this)
+      if (c.isInstanceOf[XformCallback[U,_]]) new ManyCallbacks(c.asInstanceOf[XformCallback[U,_]], this)
+      else if (c.isInstanceOf[ManyCallbacks[U]]) c.asInstanceOf[ManyCallbacks[U]].append(this)
       else /*if (c eq Promise.NoopCallback)*/ this
 
     override final def toString: String = super[DefaultPromise].toString
