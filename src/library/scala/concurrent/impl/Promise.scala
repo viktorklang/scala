@@ -154,10 +154,10 @@ private[concurrent] final object Promise {
     override def future: Future[T] = this
 
     override def transform[S](f: Try[T] => Try[S])(implicit executor: ExecutionContext): Future[S] =
-      dispatchOrAddCallbacks(new TransformationalPromise(f, executor.prepare())).future
+      dispatchOrAddCallbacks(new XformPromise(f, executor.prepare())).future
 
     override def transformWith[S](f: Try[T] => Future[S])(implicit executor: ExecutionContext): Future[S] =
-      dispatchOrAddCallbacks(new TransformationalPromise(f, executor.prepare())).future
+      dispatchOrAddCallbacks(new XformPromise(f, executor.prepare())).future
 
     @inline private[this] final def coerce[F[_],A,B](f: F[A]): F[B] = f.asInstanceOf[F[B]]
 
@@ -294,7 +294,7 @@ private[concurrent] final object Promise {
     }
 
     override final def onComplete[U](func: Try[T] => U)(implicit executor: ExecutionContext): Unit =
-      dispatchOrAddCallbacks(new TransformationalPromise[T,({type Id[a] = a})#Id,U](func, executor.prepare()))
+      dispatchOrAddCallbacks(new XformPromise[T,({type Id[a] = a})#Id,U](func, executor.prepare()))
 
     /** Tries to add the callback, if already completed, it dispatches the callback to be executed.
      *  Used by `onComplete()` to add callbacks to a promise and by `link()` to transfer callbacks
@@ -343,19 +343,19 @@ private[concurrent] final object Promise {
     }
   }
 
-  sealed abstract class AbstractTransformationalPromise[+F, T] extends DefaultPromise[T]() with Callbacks[F] with Runnable with OnCompleteRunnable {
+  sealed abstract class XformCallback[+F, T] extends DefaultPromise[T]() with Callbacks[F] with Runnable with OnCompleteRunnable {
     override final def prepend[U >: F](c: Callbacks[U]): Callbacks[U] =
-      if (c.isInstanceOf[AbstractTransformationalPromise[U,_]])
-        new ManyCallbacks(c.asInstanceOf[AbstractTransformationalPromise[U,_]], this)
+      if (c.isInstanceOf[XformCallback[U,_]])
+        new ManyCallbacks(c.asInstanceOf[XformCallback[U,_]], this)
       else
       if (c.isInstanceOf[ManyCallbacks[U]])
-        c.asInstanceOf[ManyCallbacks[U]].append(this) // TODO: fix this expensive operation. Op only happens when relocating callbacks at linking
+        c.asInstanceOf[ManyCallbacks[U]].append(this)
       else /*if (c eq Promise.NoopCallback)*/ this
 
     override final def toString: String = super[DefaultPromise].toString
   }
 
-  final class TransformationalPromise[F, M[_], T](f: Try[F] => M[T], ec: ExecutionContext) extends AbstractTransformationalPromise[F, T] {
+  final class XformPromise[F, M[_], T](f: Try[F] => M[T], ec: ExecutionContext) extends XformCallback[F, T] {
     private[this] final var _arg: AnyRef = ec // Is first the EC (needs to be pre-prepared) -> then the value -> then null
     private[this] final var _fun: Try[F] => M[T] = f // Is first the transformation function -> then null
 
@@ -380,7 +380,8 @@ private[concurrent] final object Promise {
       else this success res.asInstanceOf[T] // TODO: is this line required?
     }
 
-    // Gets invoked by the ExecutionContext, when we have a value to transform
+    // Gets invoked by the ExecutionContext, when we have a value to transform.
+    // *Happens-before* 
     override final def run(): Unit = {
       val v = _arg
       _arg = null
@@ -411,72 +412,41 @@ private[concurrent] final object Promise {
     override final def toString: String = "Noop"
   }
 
-  final class ManyCallbacks[+T] private[ManyCallbacks](
-    final val p: AbstractTransformationalPromise[T,_],
-    final val next: Callbacks[T],
-    final val size: Int) extends Callbacks[T] {
-
-    final def this(second: AbstractTransformationalPromise[T,_], first: AbstractTransformationalPromise[T,_]) =
-      this(second, first, 2)
+  // `p` is always either a ManyCallbacks or an XformCallback
+  // `next` is always either a ManyCallbacks or an XformCallback
+  final class ManyCallbacks[+T] private[ManyCallbacks](final val p: Callbacks[T], final val next: Callbacks[T]) extends Callbacks[T] {
+    final def this(second: XformCallback[T,_], first: XformCallback[T,_]) =
+      this(second: Callbacks[T], first: Callbacks[T])
 
     override final def prepend[U >: T](c: Callbacks[U]): Callbacks[U] =
-      if (c.isInstanceOf[AbstractTransformationalPromise[U,_]]) prepend(c.asInstanceOf[AbstractTransformationalPromise[U,_]])
-      else if (c.isInstanceOf[ManyCallbacks[U]]) c.asInstanceOf[ManyCallbacks[U]].concat(this)
-      else /* if (c eq NoopCallback) */this
+      if (c.isInstanceOf[XformCallback[U,_]]) prepend(c.asInstanceOf[XformCallback[U,_]])
+      else if (c.isInstanceOf[ManyCallbacks[U]]) {
+        val mc = c.asInstanceOf[ManyCallbacks[U]]
+        new ManyCallbacks(mc, this)
+      } else /* if (c eq NoopCallback) */this
 
-    final def prepend[U >: T](tp: AbstractTransformationalPromise[U,_]): ManyCallbacks[U] = 
-      new ManyCallbacks(tp, this, size + 1)
+    final def prepend[U >: T](tp: XformCallback[U,_]): ManyCallbacks[U] = 
+      new ManyCallbacks(tp, this)
 
-    final def append[U >: T](tp: AbstractTransformationalPromise[U,_]): ManyCallbacks[U] =
-      this concat new ManyCallbacks(tp, NoopCallback, 1) // TODO: Avoid this allocation
+    final def append[U >: T](tp: XformCallback[U,_]): ManyCallbacks[U] =
+      new ManyCallbacks(this, tp)
 
-    final def concat[U >: T](m: ManyCallbacks[U]): ManyCallbacks[U] = {
-      @tailrec def toBuf(buf: Array[AbstractTransformationalPromise[T,_]], pos: Int, cur: ManyCallbacks[T]): Array[AbstractTransformationalPromise[T,_]] =
-        if (pos < size) {
-          buf(pos) = cur.p
-          val cont = cur.next
-          if (cont.isInstanceOf[ManyCallbacks[T]]) toBuf(buf, pos + 1, cont.asInstanceOf[ManyCallbacks[T]])
-          else if (cont.isInstanceOf[AbstractTransformationalPromise[T,_]]) {
-            buf(pos + 1) = cont.asInstanceOf[AbstractTransformationalPromise[T,_]]
-            buf
-          } else buf
-        } else buf
-        
-        @tailrec def fromBuf(buf: Array[AbstractTransformationalPromise[T,_]], pos: Int, cbs: ManyCallbacks[U]): ManyCallbacks[U] =
-          if (pos >= 0) fromBuf(buf, pos - 1, cbs.prepend(buf(pos))) else cbs
+    final def concat[U >: T](m: ManyCallbacks[U]): ManyCallbacks[U] =
+      new ManyCallbacks(this, m)
 
-        if (size == 1) new ManyCallbacks(p, m, m.size + 1)
-        else fromBuf(toBuf(new Array[AbstractTransformationalPromise[T,_]](size), 0, this), size - 1, m)
-    }
-
-    override final def submitWithValue(v: Try[T @uncheckedVariance]): this.type = {
+    override final def submitWithValue(v: Try[T @uncheckedVariance]): this.type =
       submitWithValue(this, v)
-      this
-    }
 
-    @tailrec private[this] final def submitWithValue(cb: Callbacks[T], v: Try[T]): Unit =
+    @tailrec private[this] final def submitWithValue(cb: Callbacks[T], v: Try[T]): this.type =
       if (cb.isInstanceOf[ManyCallbacks[T]]) {
         val m = cb.asInstanceOf[ManyCallbacks[T]]
-        m.p.submitWithValue(v)
+        m.p.submitWithValue(v) // TODO: this will grow the stack—needs real-world proofing
         submitWithValue(m.next, v)
-      } else cb.submitWithValue(v)
-
-    private final def iterator: Iterator[AbstractTransformationalPromise[T,_]] = new Iterator[AbstractTransformationalPromise[T,_]] {
-      private[this] var _callback: Callbacks[T] = ManyCallbacks.this
-      override def hasNext: Boolean = _callback ne NoopCallback
-      override def next(): AbstractTransformationalPromise[T,_] = {
-        val cur = _callback
-        if (cur.isInstanceOf[ManyCallbacks[T]]) {
-          val mc = cur.asInstanceOf[ManyCallbacks[T]]
-          _callback = mc.next
-          mc.p
-        } else if (cur.isInstanceOf[AbstractTransformationalPromise[T,_]]) {
-          _callback = NoopCallback
-          cur.asInstanceOf[AbstractTransformationalPromise[T,_]]
-        } else Iterator.empty.next()
+      } else {
+        cb.submitWithValue(v)
+        this
       }
-    }
 
-    override final def toString: String = iterator.mkString("ManyCallbacks(", ",",")")
+    override final def toString: String = "ManyCallbacks"
   }
 }
