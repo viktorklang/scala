@@ -159,54 +159,42 @@ private[concurrent] final object Promise {
     override def transformWith[S](f: Try[T] => Future[S])(implicit executor: ExecutionContext): Future[S] =
       dispatchOrAddCallbacks(new XformPromise(f, executor.prepare())).future
 
-    @inline private[this] final def coerce[F[_],A,B](f: F[A]): F[B] = f.asInstanceOf[F[B]]
-
-    private[this] final def failureOrUnknown: Boolean = {
-      val v = value0
-      ((v eq null) || v.isInstanceOf[Failure[T]])
-    }
-
-    private[this] final def successOrUnknown: Boolean = {
-      val v = value0
-      ((v eq null) || v.isInstanceOf[Success[T]])
-    }
-
     override def onFailure[U](@deprecatedName('callback) pf: PartialFunction[Throwable, U])(implicit executor: ExecutionContext): Unit =
-      if (failureOrUnknown) super[Future].onFailure(pf)
+      if (!value0.isInstanceOf[Success[T]]) super[Future].onFailure(pf)
 
     override def onSuccess[U](pf: PartialFunction[T, U])(implicit executor: ExecutionContext): Unit = 
-      if (successOrUnknown) super[Future].onSuccess(pf)
+      if (!value0.isInstanceOf[Failure[T]]) super[Future].onSuccess(pf)
 
     override def foreach[U](f: T => U)(implicit executor: ExecutionContext): Unit =
-      if (successOrUnknown) super[Future].foreach(f)
+      if (!value0.isInstanceOf[Failure[T]]) super[Future].foreach(f)
 
     override def flatMap[S](f: T => Future[S])(implicit executor: ExecutionContext): Future[S] = 
-      if (successOrUnknown) super[Future].flatMap(f)
-      else coerce(this)
+      if (!value0.isInstanceOf[Failure[T]]) super[Future].flatMap(f)
+      else this.asInstanceOf[Future[S]]
 
     override def map[S](f: T => S)(implicit executor: ExecutionContext): Future[S] =
-      if (successOrUnknown) super[Future].map(f)
-      else coerce(this)
+      if (!value0.isInstanceOf[Failure[T]]) super[Future].map(f)
+      else this.asInstanceOf[Future[S]]
 
     override def filter(@deprecatedName('pred) p: T => Boolean)(implicit executor: ExecutionContext): Future[T] =
-      if (successOrUnknown) super[Future].filter(p)
-      else coerce(this)
+      if (!value0.isInstanceOf[Failure[T]]) super[Future].filter(p)
+      else this
 
     override def collect[S](pf: PartialFunction[T, S])(implicit executor: ExecutionContext): Future[S] =
-      if (successOrUnknown) super[Future].collect(pf)
-      else coerce(this)
+      if (!value0.isInstanceOf[Failure[T]]) super[Future].collect(pf)
+      else this.asInstanceOf[Future[S]]
 
     override def recoverWith[U >: T](pf: PartialFunction[Throwable, Future[U]])(implicit executor: ExecutionContext): Future[U] =
-      if (failureOrUnknown) super[Future].recoverWith(pf)
-      else coerce(this)
+      if (!value0.isInstanceOf[Success[T]]) super[Future].recoverWith(pf)
+      else this.asInstanceOf[Future[U]]
 
     override def recover[U >: T](pf: PartialFunction[Throwable, U])(implicit executor: ExecutionContext): Future[U] =
-      if (failureOrUnknown) super[Future].recover(pf)
-      else coerce(this)
+      if (!value0.isInstanceOf[Success[T]]) super[Future].recover(pf)
+      else this.asInstanceOf[Future[U]]
 
     override def mapTo[S](implicit tag: scala.reflect.ClassTag[S]): Future[S] =
-      if (successOrUnknown) super[Future].mapTo[S](tag)
-      else coerce(this)
+      if (!value0.isInstanceOf[Failure[T]]) super[Future].mapTo[S](tag)
+      else this.asInstanceOf[Future[S]]
 
     override def toString: String = toString0
 
@@ -283,7 +271,7 @@ private[concurrent] final object Promise {
       val state = get()
       if (state.isInstanceOf[Try[T]]) false
       else if (state.isInstanceOf[Callbacks[T]]) {
-        val rv = if (resolved) v else resolve(v)
+        val rv = if (resolved) v else resolve(v) // Only resolve once, saves a lot of CPU cycles
         if (compareAndSet(state, rv)) {
           state.asInstanceOf[Callbacks[T]].submitWithValue(rv)
           true
