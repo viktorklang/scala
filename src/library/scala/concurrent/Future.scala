@@ -9,18 +9,16 @@
 package scala.concurrent
 
 import scala.language.higherKinds
-import scala.concurrent.{ExecutionContext, Awaitable, CanAwait}
 
 import java.util.concurrent.{CountDownLatch, TimeUnit, TimeoutException}
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 
 import scala.util.control.{NonFatal, NoStackTrace}
 import scala.util.{Try, Success, Failure}
 import scala.concurrent.duration._
+import scala.collection.mutable.Builder
 import scala.collection.generic.CanBuildFrom
 import scala.reflect.ClassTag
-
-import scala.collection.mutable.Builder
 
 /** A `Future` represents a value which may or may not *currently* be available,
  *  but will be available at some point, or an exception if that value could not be made available.
@@ -96,7 +94,8 @@ import scala.collection.mutable.Builder
  * Completion of the Future must *happen-before* the invocation of the callback.
  */
 trait Future[+T] extends Awaitable[T] {
-  import Future.InternalCallbackExecutor
+  import Future.{ InternalCallbackExecutor => internalExecutor }
+
   /* Callbacks */
 
   /** When this future is completed successfully (i.e., with a value),
@@ -205,7 +204,7 @@ trait Future[+T] extends Awaitable[T] {
       t =>
         if (t.isInstanceOf[Failure[T]]) Success(t.asInstanceOf[Failure[T]].exception)
         else Future.failedFailure
-    })(InternalCallbackExecutor)
+    })(internalExecutor)
 
 
   /* Monadic operations */
@@ -311,7 +310,7 @@ trait Future[+T] extends Awaitable[T] {
    * @tparam S  the type of the returned `Future`
    * @group Transformations
    */
-  def flatten[S](implicit ev: T <:< Future[S]): Future[S] = flatMap(ev)(InternalCallbackExecutor)
+  def flatten[S](implicit ev: T <:< Future[S]): Future[S] = flatMap(ev)(internalExecutor)
 
   /** Creates a new future by filtering the value of the current future with a predicate.
    *
@@ -442,7 +441,7 @@ trait Future[+T] extends Awaitable[T] {
    * @group Transformations
    */
   def zip[U](that: Future[U]): Future[(T, U)] =
-    zipWith(that)(Future.zipWithTuple2)(InternalCallbackExecutor)
+    zipWith(that)(Future.zipWithTuple2)(internalExecutor)
 
   /** Zips the values of `this` and `that` future using a function `f`,
    *  and creates a new future holding the result.
@@ -462,7 +461,7 @@ trait Future[+T] extends Awaitable[T] {
    * @group Transformations
    */
   def zipWith[U, R](that: Future[U])(f: (T, U) => R)(implicit executor: ExecutionContext): Future[R] =
-    flatMap(r1 => that.map(r2 => f(r1, r2)))(InternalCallbackExecutor)
+    flatMap(r1 => that.map(r2 => f(r1, r2)))(internalExecutor)
 
   /** Creates a new future which holds the result of this future if it was completed successfully, or, if not,
    *  the result of the `that` future if `that` is completed successfully.
@@ -486,7 +485,7 @@ trait Future[+T] extends Awaitable[T] {
   def fallbackTo[U >: T](that: Future[U]): Future[U] =
     if (this eq that) this
     else {
-      implicit val ec = InternalCallbackExecutor
+      implicit val ec = internalExecutor
       transformWith {
         t =>
           if (t.isInstanceOf[Success[T]]) this
@@ -503,7 +502,7 @@ trait Future[+T] extends Awaitable[T] {
    * @group Transformations
    */
   def mapTo[S](implicit tag: ClassTag[S]): Future[S] = {
-    implicit val ec = InternalCallbackExecutor
+    implicit val ec = internalExecutor
     val boxedClass = {
       val c = tag.runtimeClass
       if (c.isPrimitive) Future.toBoxed(c) else c
@@ -546,7 +545,7 @@ trait Future[+T] extends Awaitable[T] {
     transform {
       result =>
         try pf.applyOrElse[Try[T], Any](result, Future.id[Try[T]])
-        catch { case NonFatal(t) => executor reportFailure t }
+        catch { case t if NonFatal(t) => executor.reportFailure(t) }
 
         result
     }
@@ -590,8 +589,7 @@ object Future {
   private[concurrent] final val failedFailure =
     Failure[Nothing](new NoSuchElementException("Future.failed not completed with a throwable.") with NoStackTrace)
 
-  private[concurrent] final val recoverWithFailedMarker =
-    Future.failed[Nothing](new Throwable with NoStackTrace)
+  private[concurrent] final val recoverWithFailedMarker =  scala.concurrent.Future.failed[Nothing](new Throwable with NoStackTrace)
 
   private[concurrent] final val recoverWithFailed =
     (t: Throwable) => recoverWithFailedMarker
@@ -600,12 +598,12 @@ object Future {
     new NoSuchElementException("Future.firstCompletedOf empty collection")
 
   private[this] final val _zipWithTuple2: (Any, Any) => (Any, Any) = Tuple2.apply _
-  private[concurrent] final def zipWithTuple2[T,U] = _zipWithTuple2.asInstanceOf[(T,U) => (T,U)]
+  final def zipWithTuple2[T,U] = _zipWithTuple2.asInstanceOf[(T,U) => (T,U)]
 
   private[this] final val _addToBuilderFun: (Builder[Any, Nothing], Any) => Builder[Any, Nothing] = (b: Builder[Any, Nothing], e: Any) => b += e
-  private[concurrent] final def addToBuilderFun[A, M[_]] =  _addToBuilderFun.asInstanceOf[Function2[Builder[A, M[A]], A, Builder[A, M[A]]]]
+  final def addToBuilderFun[A, M[_]] =  _addToBuilderFun.asInstanceOf[Function2[Builder[A, M[A]], A, Builder[A, M[A]]]]
 
-  //---------------------------------------------------------------------------//
+  private[concurrent] final val successOfUnit: Success[Unit] = Success(())
 
   /** A Future which is never completed.
    */
@@ -656,9 +654,9 @@ object Future {
     override def toString: String = "Future(<never>)"
   }
 
-  /** A Future which is always completed with the Unit value.
+  /** A Future which is completed with the Unit value.
    */
-  final val unit: Future[Unit] = successful(())
+  final val unit: Future[Unit] = Promise.fromTry(successOfUnit).future
 
   /** Creates an already completed Future with the specified exception.
    *
@@ -691,6 +689,7 @@ object Future {
   *  {{{
   *  val f1 = Future(expr)
   *  val f2 = Future.unit.map(_ => expr)
+  *  val f3 = Future.unit.transform(_ => Success(expr))
   *  }}}
   *
   *  The result becomes available once the asynchronous computation is completed.
@@ -701,10 +700,27 @@ object Future {
   *  @return          the `Future` holding the result of the computation
   */
   def apply[T](body: =>T)(implicit @deprecatedName('execctx) executor: ExecutionContext): Future[T] =
-    unit.transform {
-      r => if (r.isInstanceOf[Success[T @unchecked]]) Success(body)
-           else r.asInstanceOf[Failure[T]]
-    }
+    unit.transform { _ => Success(body) }
+
+  /** Starts an asynchronous computation and returns a `Future` instance with the result of that computation once it completes.
+  *
+  *  The following expressions are semantically equivalent:
+  *
+  *  {{{
+  *  val f1 = Future(expr).flatten
+  *  val f2 = Future.defer(expr)
+  *  val f3 = Future.unit.flatMap(_ => expr)
+  *  }}}
+  *
+  *  The result becomes available once the resulting Future of the asynchronous computation is completed.
+  *
+  *  @tparam T        the type of the result
+  *  @param body      the asynchronous computation, returning a Future
+  *  @param executor  the execution context on which the `body` is evaluated in
+  *  @return          the `Future` holding the result of the computation
+  */
+  def defer[T](body: => Future[T])(implicit executor: ExecutionContext): Future[T] =
+    unit.transformWith { _ => body }
 
   /** Simple version of `Future.traverse`. Asynchronously and non-blockingly transforms a `TraversableOnce[Future[A]]`
    *  into a `Future[TraversableOnce[A]]`. Useful for reducing many `Future`s into a single `Future`.
@@ -716,7 +732,7 @@ object Future {
    */
   def sequence[A, M[X] <: TraversableOnce[X]](in: M[Future[A]])(implicit cbf: CanBuildFrom[M[Future[A]], A, M[A]], executor: ExecutionContext): Future[M[A]] = {
     in.foldLeft(successful(cbf(in))) {
-      (fr, fa) => fr.zipWith(fa)(addToBuilderFun)
+      (fr, fa) => fr.zipWith(fa)(Future.addToBuilderFun)
     }.map(_.result())(InternalCallbackExecutor)
   }
 
@@ -731,8 +747,14 @@ object Future {
     if (futures.isEmpty) Future.failed[T](Future.firstCompletedOfException)
     else {
     val p = Promise[T]()
-    val completeFirst: Try[T] => Unit = p tryComplete _
-    futures.foreach(_ onComplete completeFirst)
+    val firstCompleteHandler = new AtomicReference[Promise[T]](p) with (Try[T] => Unit) {
+      override def apply(v1: Try[T]): Unit =  {
+        val r = getAndSet(null)
+        if (r ne null)
+          r tryComplete v1
+      }
+    }
+    futures foreach { _ onComplete firstCompleteHandler }
     p.future
   }
 
@@ -752,14 +774,11 @@ object Future {
       val result = Promise[Option[T]]()
       val ref = new AtomicInteger(futuresBuffer.size)
       val search: Try[T] => Unit = v => try {
-        v match {
-          case Success(r) if p(r) => result tryComplete Success(Some(r))
-          case _ =>
-        }
+        if (v.isSuccess && p(v.get))
+          result.trySuccess(v.toOption)
       } finally {
-        if (ref.decrementAndGet == 0) {
-          result tryComplete Success(None)
-        }
+        if (ref.decrementAndGet == 0)
+          result.trySuccess(None)
       }
 
       futuresBuffer.foreach(_ onComplete search)
@@ -892,7 +911,7 @@ object Future {
    */
   def traverse[A, B, M[X] <: TraversableOnce[X]](in: M[A])(fn: A => Future[B])(implicit cbf: CanBuildFrom[M[A], B, M[B]], executor: ExecutionContext): Future[M[B]] =
     in.foldLeft(successful(cbf(in))) {
-      (fr, a) => fr.zipWith(fn(a))(addToBuilderFun)
+      (fr, a) => fr.zipWith(fn(a))(Future.addToBuilderFun)
     }.map(_.result())(InternalCallbackExecutor)
 
 
@@ -915,11 +934,9 @@ object Future {
   // by just not ever using it itself. scala.concurrent
   // doesn't need to create defaultExecutionContext as
   // a side effect.
-  private[concurrent] final object InternalCallbackExecutor extends ExecutionContext with BatchingExecutor {
-    override protected def unbatchedExecute(r: Runnable): Unit =
-      r.run()
-    override def reportFailure(t: Throwable): Unit =
-      throw new IllegalStateException("problem in scala.concurrent internal callback", t)
+  private[concurrent] final object InternalCallbackExecutor extends ExecutionContext with java.util.concurrent.Executor with BatchingExecutor {
+    override protected def unbatchedExecute(r: Runnable): Unit = r.run()
+    override def reportFailure(t: Throwable): Unit = ExecutionContext.defaultReporter(t)
   }
 }
 
