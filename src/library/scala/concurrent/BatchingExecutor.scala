@@ -15,7 +15,7 @@ package scala.concurrent
 import java.util.concurrent.Executor
 import java.util.Objects
 import scala.util.control.NonFatal
-import scala.annotation.tailrec
+import scala.annotation.{switch, tailrec}
 
 /**
  * Marker trait to indicate that a Runnable is Batchable by BatchingExecutors
@@ -24,7 +24,7 @@ trait Batchable {
   self: Runnable =>
 }
 
-private[concurrent] object BatchingExecutorStatics {
+private[concurrent] final object BatchingExecutorStatics {
   final val emptyBatchArray: Array[Runnable] = new Array[Runnable](0)
   final val marker = ""
   final object MissingParentBlockContext extends BlockContext {
@@ -111,26 +111,23 @@ private[concurrent] trait BatchingExecutor extends Executor {
       this.size = sz + 1
     }
 
-    final def runNext(): Boolean = {
-      val sz = this.size
-      if (sz == 0) false
-      else {
-        val r =
-          if (sz == 1) {
+    final def runNext(): Boolean =
+      (this.size: @switch) match {
+        case 0 => false
+        case 1 =>
           val next = this.first
           this.first = null
-          next
-        } else {
+          this.size = 0// Important to update prior to `r.run()`
+          next.run()
+          this.size > 0
+        case sz =>
           val o = this.other
           val next = o(sz - 2)
           o(sz - 2) = null
-          next
-        }
-        this.size = sz - 1// Important to update prior to `r.run()`
-        r.run()
-        this.size > 0// Could have changed during next.run()
+          this.size = sz - 1// Important to update prior to `r.run()`
+          next.run()
+          this.size > 0
       }
-    }
 
     // This method runs in the delegate ExecutionContext's thread
     override final def run(): Unit = {
