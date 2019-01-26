@@ -47,43 +47,6 @@ private[impl] final class CompletionLatch[T] extends AbstractQueuedSynchronizer 
 
 private[concurrent] object Promise {
     /**
-     * Link represents a completion dependency between 2 DefaultPromises.
-     * As the DefaultPromise referred to by a Link can itself be linked to another promise
-     * `relink` traverses such chains and compresses them so that the link always points
-     * to the root of the dependency chain.
-     *
-     * In order to conserve memory, the owner of a Link (a DefaultPromise) is not stored
-     * on the Link, but is instead passed in as a parameter to the operation(s).
-     *
-     * If when compressing a chain of Links it is discovered that the root has been completed,
-     * the `owner`'s value is completed with that value, and the Link chain is discarded.
-     **/
-    private[concurrent] final class Link[T](to: DefaultPromise[T]) extends AtomicReference[DefaultPromise[T]](to) {
-      /**
-       * Compresses this chain and returns the currently known root of this chain of Links.
-       **/
-      final def promise(owner: DefaultPromise[T]): DefaultPromise[T] = {
-        val c = get()
-        compressed(current = c, target = c, owner = owner)
-      }
-
-      /**
-       * The combination of traversing and possibly unlinking of a given `target` DefaultPromise.
-       **/
-      @inline @tailrec private[this] final def compressed(current: DefaultPromise[T], target: DefaultPromise[T], owner: DefaultPromise[T]): DefaultPromise[T] = {
-        val value = target.get()
-        if (value.isInstanceOf[Callbacks[T]]) {
-          if (compareAndSet(current, target)) target // Link
-          else compressed(current = get(), target = target, owner = owner) // Retry
-        } else if (value.isInstanceOf[Link[T]]) compressed(current = current, target = value.asInstanceOf[Link[T]].get(), owner = owner) // Compress
-        else /*if (value.isInstanceOf[Try[T]])*/ {
-          owner.unlink(value.asInstanceOf[Try[T]]) // Discard links
-          owner
-        }
-      }
-    }
-
-    /**
      * The process of "resolving" a Try is to validate that it only contains
      * those values which makes sense in the context of Futures.
      **/
@@ -183,10 +146,9 @@ private[concurrent] object Promise {
       if (!get().isInstanceOf[Success[T]]) super.failed
       else Future.failedFailureFuture // Cached instance in case of already known success
 
-    @tailrec override final def toString: String = {
+    override final def toString: String = {
       val state = get()
       if (state.isInstanceOf[Try[T]]) "Future("+state+")"
-      else if (state.isInstanceOf[Link[T]]) state.asInstanceOf[Link[T]].promise(this).toString
       else /*if (state.isInstanceOf[Callbacks[T]]) */ "Future(<not completed>)"
     }
 
@@ -228,11 +190,10 @@ private[concurrent] object Promise {
 
     override final def value: Option[Try[T]] = Option(value0)
 
-    @tailrec // returns null if not completed
+    // returns null if not completed
     private final def value0: Try[T] = {
       val state = get()
       if (state.isInstanceOf[Try[T]]) state.asInstanceOf[Try[T]]
-      else if (state.isInstanceOf[Link[T]]) state.asInstanceOf[Link[T]].promise(this).value0
       else /*if (state.isInstanceOf[Callbacks[T]])*/ null
     }
 
@@ -249,9 +210,6 @@ private[concurrent] object Promise {
           if (state ne Noop) submitWithValue(state.asInstanceOf[Callbacks[T]], resolved)
           true
         } else tryComplete0(get(), resolved)
-      } else if (state.isInstanceOf[Link[T]]) {
-        val p = state.asInstanceOf[Link[T]].promise(this) // If this returns owner/this, we are in a completed link
-        (p ne this) && p.tryComplete0(p.get(), resolved) // Use this to get tailcall optimization and avoid re-resolution
       } else /* if(state.isInstanceOf[Try[T]]) */ false
 
     override final def completeWith(other: Future[T]): this.type = {
@@ -268,28 +226,20 @@ private[concurrent] object Promise {
     }
 
     /** Tries to add the callback, if already completed, it dispatches the callback to be executed.
-     *  Used by `onComplete()` to add callbacks to a promise and by `link()` to transfer callbacks
-     *  to the root promise when linking two promises together.
+     *  Used by `onComplete()` to add callbacks to a promise.
      */
-    @tailrec private final def dispatchOrAddCallbacks[C <: Callbacks[T]](state: AnyRef, callbacks: C): C =
+    @tailrec private final def dispatchOrAddCallbacks(state: AnyRef, callback: Transformation[T, _]): callback.type =
       if (state.isInstanceOf[Try[T]]) {
-        submitWithValue(callbacks, state.asInstanceOf[Try[T]]) // invariant: callbacks should never be Noop here
-        callbacks
-      } else if (state.isInstanceOf[Callbacks[T]]) {
-        if(compareAndSet(state, if (state ne Noop) concatCallbacks(callbacks, state.asInstanceOf[Callbacks[T]]) else callbacks)) callbacks
-        else dispatchOrAddCallbacks(get(), callbacks)
-      } else /*if (state.isInstanceOf[Link[T]])*/ {
-        val p = state.asInstanceOf[Link[T]].promise(this)
-        p.dispatchOrAddCallbacks(p.get(), callbacks)
+        submitWithValue(callback, state.asInstanceOf[Try[T]]) // invariant: callbacks should never be Noop here
+        callback
+      } else /* if (state.isInstanceOf[Callbacks[T]]) */ {
+        if(compareAndSet(state, if (state ne Noop) concatCallbacks(callback, state.asInstanceOf[Callbacks[T]]) else callback)) callback
+        else dispatchOrAddCallbacks(get(), callback)
       }
 
-    // IMPORTANT: Noop should never be passed in here, neither as left OR as right
-    @tailrec private[this] final def concatCallbacks(left: Callbacks[T], right: Callbacks[T]): Callbacks[T] =
-      if (left.isInstanceOf[Transformation[T,_]]) new ManyCallbacks[T](left.asInstanceOf[Transformation[T,_]], right)
-      else /*if (left.isInstanceOf[ManyCallbacks[T]) */ { // This should only happen when linking
-        val m = left.asInstanceOf[ManyCallbacks[T]]
-        concatCallbacks(m.rest, new ManyCallbacks(m.first, right))
-      }
+    // IMPORTANT: Noop should never be passed in here, neither as callback OR as rest
+    private[this] final def concatCallbacks(callback: Transformation[T, _], rest: Callbacks[T]): Callbacks[T] =
+      new ManyCallbacks[T](callback, rest)
 
     // IMPORTANT: Noop should not be passed in here, `callbacks` cannot be null
     @tailrec
@@ -301,41 +251,6 @@ private[concurrent] object Promise {
       } else {
         callbacks.asInstanceOf[Transformation[T, _]].submitWithValue(resolved)
       }
-
-    /** Link this promise to the root of another promise.
-     */
-    @tailrec private[concurrent] final def linkRootOf(target: DefaultPromise[T], link: Link[T]): Unit =
-      if (this ne target) {
-        val state = get()
-        if (state.isInstanceOf[Try[T]]) {
-          if(!target.tryComplete0(target.get(), state.asInstanceOf[Try[T]]))
-            throw new IllegalStateException("Cannot link completed promises together")
-        } else if (state.isInstanceOf[Callbacks[T]]) {
-          val l = if (link ne null) link else new Link(target)
-          val p = l.promise(this)
-          if (p ne this) {
-            if (compareAndSet(state, l)) {
-              if (state ne Noop) p.dispatchOrAddCallbacks(p.get(), state.asInstanceOf[Callbacks[T]]) // Noop-check is important here
-            } else linkRootOf(p, l)
-          }
-        } else /* if (state.isInstanceOf[Link[T]]) */
-          state.asInstanceOf[Link[T]].promise(this).linkRootOf(target, link)
-      }
-
-    /**
-     * Unlinks (removes) the link chain if the root is discovered to be already completed,
-     * and completes the `owner` with that result.
-     **/
-    @tailrec private[concurrent] final def unlink(resolved: Try[T]): Unit = {
-      val state = get()
-      if (state.isInstanceOf[Link[T]]) {
-        val next = if (compareAndSet(state, resolved)) state.asInstanceOf[Link[T]].get() else this
-        next.unlink(resolved)
-      } else {
-        if(state.isInstanceOf[Callbacks[T]])
-          tryComplete0(state, resolved) // Already resolved
-      }
-    }
   }
 
   // Constant byte tags for unpacking transformation function inputs or outputs
@@ -410,11 +325,7 @@ private[concurrent] object Promise {
     }
 
     @inline private[this] final def completeWithLink(f: Future[T]): Try[T] = {
-      if (f.isInstanceOf[DefaultPromise[T]])
-        f.asInstanceOf[DefaultPromise[T]].linkRootOf(this, null)
-      else
-        completeWith(f)
-
+      completeWith(f)
       null
     }
 
