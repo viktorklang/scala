@@ -213,14 +213,12 @@ private[concurrent] object Promise {
       } else /* if(state.isInstanceOf[Try[T]]) */ false
 
     override final def completeWith(other: Future[T]): this.type = {
-      if (other ne this) {
-        val state = get()
-        if (!state.isInstanceOf[Try[T]]) {
-          val resolved = if (other.isInstanceOf[DefaultPromise[T]]) other.asInstanceOf[DefaultPromise[T]].value0 else other.value.orNull
-          if (resolved ne null) tryComplete0(state, resolved)
-          else other.onComplete(this)(InternalCallbackExecutor)
-        }
-      }
+      if ((other ne this) && other.isInstanceOf[DefaultPromise[T]]) {
+        val dp = other.asInstanceOf[DefaultPromise[T]]
+        val resolved = dp.value0
+        if (resolved ne null) tryComplete0(get(), resolved)
+        else dp.dispatchOrAddCallbacks(dp.get(), new Transformation[T, Unit](Xform_completeWith, this, InternalCallbackExecutor))
+      } else other.onComplete(this)(InternalCallbackExecutor)
 
       this
     }
@@ -267,6 +265,7 @@ private[concurrent] object Promise {
   final val Xform_recoverWith   = 8
   final val Xform_filter        = 9
   final val Xform_collect       = 10
+  final val Xform_completeWith  = 11
 
     /* Marker trait
    */
@@ -292,20 +291,38 @@ private[concurrent] object Promise {
   ) extends DefaultPromise[T]() with Callbacks[F] with Runnable with Batchable with OnCompleteRunnable {
     final def this(xform: Int, f: _ => _, ec: ExecutionContext) = this(f.asInstanceOf[Any => Any], ec.prepare(), null, xform.toByte)
 
+    private final def xform: Int = _xform.toInt
+    private final def fun: Any => Any = _fun
+
     final def benefitsFromBatching: Boolean = _xform != Xform_onComplete && _xform != Xform_foreach
+
+    private final def submitWithValueToEC(resolved: Try[F]): Unit = {
+      _arg = resolved
+      val e = _ec
+      try e.execute(this) /* Safe publication of _arg, _fun, _ec */
+      catch {
+        case t: Throwable => handleFailure(t, e)
+      }
+    }
+
+    @tailrec private[this] final def submitWithValue0(transformation: Transformation[F,_], resolved: Try[F]): Unit =
+      if (transformation.xform != Xform_completeWith) transformation.submitWithValueToEC(resolved)
+      else { // Traverse the completion chain and complete as we walk the chain
+        val tstate = transformation.get()
+        if (tstate.isInstanceOf[Transformation[F,_]] && (tstate ne Noop)) {
+          val candidate_next = tstate.asInstanceOf[Transformation[F,_]].fun.asInstanceOf[Transformation[F,_]]
+          val next = if (transformation.compareAndSet(tstate, resolved)) candidate_next else transformation
+          submitWithValue0(next, resolved)
+        } else
+          transformation.submitWithValueToEC(resolved)
+      }
 
     // Gets invoked when a value is available, schedules it to be run():ed by the ExecutionContext
     // submitWithValue *happens-before* run(), through ExecutionContext.execute.
     // Invariant: _arg is `ExecutionContext`, and non-null. `this` ne Noop.
     // requireNonNull(resolved) will hold as guarded by `resolve`
     final def submitWithValue(resolved: Try[F]): this.type = {
-      val e = _ec
-      _arg = resolved
-      try e.execute(this) /* Safe publication of _arg, _fun, _ec */
-      catch {
-        case t: Throwable => handleFailure(t, e)
-      }
-
+      submitWithValue0(this, resolved)
       this
     }
 
@@ -368,6 +385,9 @@ private[concurrent] object Promise {
             case Xform_collect       =>
               if (v.isInstanceOf[Success[F]]) Success(fun.asInstanceOf[PartialFunction[F, T]].applyOrElse(v.asInstanceOf[Success[F]].value, Future.collectFailed))
               else v.asInstanceOf[Failure[T]] // Already resolved
+            case Xform_completeWith  =>
+              fun(v)
+              null
             case _                   =>
               Failure(new IllegalStateException("BUG: encountered transformation promise with illegal type: " + _xform))
           }

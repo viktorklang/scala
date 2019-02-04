@@ -137,7 +137,7 @@ private[concurrent] trait BatchingExecutor extends Executor {
         if (resubmitOnBlock) BlockContext.usingBlockContext(this)(this)
         else runWithoutResubmit(runUntilFailureOrDone())
 
-      _tasksLocal.remove()
+      _tasksLocal.set(BatchingExecutorStatics.marker)
       if (failure != null)
         throw handleRunFailure(failure)
     }
