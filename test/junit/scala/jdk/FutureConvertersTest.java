@@ -97,8 +97,8 @@ public class FutureConvertersTest {
             }
             return x;
         });
-        p.success("Hello");
         latch.countDown();
+        p.success("Hello");
         assertEquals("Hello", second.toCompletableFuture().get());
     }
 
@@ -115,8 +115,8 @@ public class FutureConvertersTest {
                 throw new RuntimeException(e);
             }
         });
-        p.success("Hello");
         latch.countDown();
+        p.success("Hello");
         assertNull("result must be Void", second.toCompletableFuture().get());
     }
 
@@ -133,8 +133,8 @@ public class FutureConvertersTest {
                 throw new RuntimeException(e);
             }
         });
-        p.success("Hello");
         latch.countDown();
+        p.success("Hello");
         assertNull("result must be Void", second.toCompletableFuture().get());
     }
 
@@ -153,8 +153,8 @@ public class FutureConvertersTest {
             }
             return x.length() + y;
         });
-        p.success("Hello");
         latch.countDown();
+        p.success("Hello");
         assertEquals((Integer) 47, second.toCompletableFuture().get());
     }
 
@@ -172,8 +172,8 @@ public class FutureConvertersTest {
                 throw new RuntimeException(e);
             }
         });
-        p.success("Hello");
         latch.countDown();
+        p.success("Hello");
         assertNull("result must be Void", second.toCompletableFuture().get());
     }
 
@@ -191,8 +191,8 @@ public class FutureConvertersTest {
                 throw new RuntimeException(e);
             }
         });
-        p.success("Hello");
         latch.countDown();
+        p.success("Hello");
         assertNull("result must be Void", second.toCompletableFuture().get());
     }
 
@@ -211,8 +211,8 @@ public class FutureConvertersTest {
             }
             return x.length();
         });
-        p.success("Hello");
         latch.countDown();
+        p.success("Hello");
         assertEquals((Integer) 5, second.toCompletableFuture().get());
     }
 
@@ -230,8 +230,8 @@ public class FutureConvertersTest {
                 throw new RuntimeException(e);
             }
         });
-        p.success("Hello");
         latch.countDown();
+        p.success("Hello");
         assertNull("result must be Void", second.toCompletableFuture().get());
     }
 
@@ -249,8 +249,8 @@ public class FutureConvertersTest {
                 throw new RuntimeException(e);
             }
         });
-        p.success("Hello");
         latch.countDown();
+        p.success("Hello");
         assertNull("result must be Void", second.toCompletableFuture().get());
     }
 
@@ -268,8 +268,8 @@ public class FutureConvertersTest {
             }
             return CompletableFuture.completedFuture(x);
         });
-        p.success("Hello");
         latch.countDown();
+        p.success("Hello");
         assertEquals("Hello", second.toCompletableFuture().get());
     }
 
@@ -286,8 +286,8 @@ public class FutureConvertersTest {
                 throw new RuntimeException(ex);
             }
         });
-        p.success("Hello");
         latch.countDown();
+        p.success("Hello");
         assertEquals("Hello", second.toCompletableFuture().get());
     }
 
@@ -305,8 +305,8 @@ public class FutureConvertersTest {
             }
             return v.length();
         });
-        p.success("Hello");
         latch.countDown();
+        p.success("Hello");
         assertEquals((Integer) 5, second.toCompletableFuture().get());
     }
 
@@ -324,8 +324,8 @@ public class FutureConvertersTest {
             }
             return e.getMessage();
         });
-        p.failure(new RuntimeException("Hello"));
         latch.countDown();
+        p.failure(new RuntimeException("Hello"));
         assertEquals("Hello", second.toCompletableFuture().get());
     }
 
